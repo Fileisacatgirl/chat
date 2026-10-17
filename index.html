@@ -1,0 +1,2043 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>DSH P2P · 双人加密聊天</title>
+<!--
+  单文件原型：一个网页 + 一串密码，经公共哑信箱 ntfy.sh 端到端加密聊天。
+  协议：D:\通信项目\docs\02-协议设计-口令派生与消息格式.md
+  核心逻辑：与 proto/core.mjs **逐字节同源**（由 _sync-inline.mjs 注入，verify-protocol.mjs 断言哈希一致）。
+  外部依赖：仅 hash-wasm@4.12.0 的 argon2.umd.min.js（先 CDN，失败回退同目录 vendor/）。
+  为什么不用 <script type="module" src="core.mjs">：file:// 下浏览器（Chrome/Edge）会以 CORS
+  拒绝加载外部 module 脚本（origin 'null'），而本页必须支持直接双击打开。实测证据见 RESULT.md。
+-->
+<style>
+  :root{
+    --bg:#f5f6f8; --fg:#15181d; --dim:#6b7280; --line:#e2e5ea; --card:#fff;
+    --mine:#1f6feb; --minefg:#fff; --theirs:#eceff3; --theirsfg:#15181d;
+    --danger:#b42318; --warn:#8a5a00; --ok:#177245;
+    --safe-b: env(safe-area-inset-bottom, 0px);
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#0f1115; --fg:#e8eaed; --dim:#9aa1ab; --line:#252a32; --card:#171a20;
+           --mine:#2f6fd0; --minefg:#fff; --theirs:#252a32; --theirsfg:#e8eaed;
+           --danger:#ff8a80; --warn:#ffc46b; --ok:#5ddc9a; }
+  }
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent}
+  html,body{margin:0;padding:0;height:100%}
+  body{background:var(--bg);color:var(--fg);font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans CJK SC","Microsoft YaHei",sans-serif;
+       display:flex;flex-direction:column;min-height:100dvh;overscroll-behavior-y:contain}
+  main{flex:1 1 auto;display:flex;flex-direction:column;min-height:0}
+  [hidden]{display:none !important}
+  #banner{padding:0}
+  .note{padding:10px 14px;font-size:13.5px;line-height:1.45;border-bottom:1px solid var(--line);background:var(--card)}
+  .note.err{color:var(--danger);font-weight:600}
+  .note.warn{color:var(--warn)}
+  .note.info{color:var(--dim)}
+  .note code{font-family:ui-monospace,Consolas,monospace;font-size:12.5px;word-break:break-all}
+
+  /* ---------------- 首屏 ---------------- */
+  #gate{justify-content:center;padding:24px 18px calc(24px + var(--safe-b))}
+  .brand{text-align:center;margin:0 0 4px;font-size:22px;font-weight:700;letter-spacing:.02em}
+  .sub{text-align:center;color:var(--dim);font-size:13.5px;margin:0 0 22px}
+  .field{display:flex;flex-direction:column;gap:10px;max-width:520px;width:100%;margin:0 auto}
+  label{font-size:13.5px;color:var(--dim)}
+  input,textarea,button{font:inherit;color:inherit}
+  input[type=password],input[type=text]{
+    width:100%;padding:13px 14px;border:1px solid var(--line);border-radius:12px;
+    background:var(--card);font-size:16px;font-family:ui-monospace,Consolas,monospace}
+  input:focus{outline:2px solid var(--mine);outline-offset:1px}
+  button{
+    padding:13px 16px;border:0;border-radius:12px;background:var(--mine);color:var(--minefg);
+    font-weight:600;cursor:pointer;font-size:16px}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  button.ghost{background:transparent;color:var(--fg);border:1px solid var(--line);font-weight:500;font-size:14px;padding:9px 12px;border-radius:10px}
+  .privacy{text-align:center;color:var(--dim);font-size:12.5px;margin-top:14px;line-height:1.5}
+  .hint{font-size:12.5px;color:var(--dim);max-width:520px;margin:8px auto 0;text-align:center;min-height:1.2em}
+  .hint.err{color:var(--danger);font-weight:600}
+  .strength{font-size:12.5px;max-width:520px;margin:2px auto 0}
+  .strength.warn{color:var(--warn)}
+  .strength.ok{color:var(--ok)}
+
+  /* ---------------- 聊天页 ---------------- */
+  header.top{
+    display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--line);
+    background:var(--card);position:sticky;top:0;z-index:5}
+  .status{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--dim);flex:1 1 auto;min-width:0}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--dim);flex:0 0 auto}
+  .dot.sse{background:var(--ok)} .dot.polling{background:var(--warn)}
+  .dot.error{background:var(--danger)}
+  .status b{color:var(--fg);font-weight:600}
+  .fp{font-family:ui-monospace,Consolas,monospace;font-size:12.5px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .toolbar{display:flex;gap:8px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--card)}
+  #list{flex:1 1 auto;overflow-y:auto;padding:14px 12px 6px;-webkit-overflow-scrolling:touch}
+  .empty{text-align:center;color:var(--dim);font-size:14px;padding:40px 12px}
+  .msg{max-width:82%;margin:0 0 10px;padding:9px 12px;border-radius:14px;word-break:break-word;white-space:pre-wrap;
+       box-shadow:0 1px 1px rgba(0,0,0,.04)}
+  .msg .meta{font-size:11px;opacity:.72;margin-top:5px;display:flex;gap:8px;justify-content:flex-end}
+  .msg.mine{margin-left:auto;background:var(--mine);color:var(--minefg);border-bottom-right-radius:5px}
+  .msg.theirs{margin-right:auto;background:var(--theirs);color:var(--theirsfg);border-bottom-left-radius:5px}
+  .msg.pending .meta::after{content:"· 发送中…"}
+  .msg.unconfirmed .meta::after{content:"· 服务端未确认" }
+  .msg.queued .meta::after{content:"· 待重发"}
+  footer.compose{display:flex;gap:8px;padding:10px 12px calc(10px + var(--safe-b));border-top:1px solid var(--line);background:var(--card);align-items:flex-end}
+  #text{flex:1 1 auto;resize:none;max-height:132px;min-height:44px;padding:11px 12px;border:1px solid var(--line);
+        border-radius:12px;background:var(--bg);font-size:16px}
+  #send{flex:0 0 auto;padding:12px 18px}
+  #toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(78px + var(--safe-b));max-width:90vw;
+         background:#000d;color:#fff;padding:9px 14px;border-radius:10px;font-size:13.5px;opacity:0;transition:opacity .2s;
+         pointer-events:none;z-index:20}
+  #toast.show{opacity:1}
+</style>
+</head>
+<body>
+<div id="banner"></div>
+
+<!-- ================= 首屏 ================= -->
+<main id="gate">
+  <h1 class="brand">双人加密聊天</h1>
+  <p class="sub">两个人 · 同一串密码 · 一个网页</p>
+  <div class="field">
+    <label for="pw">密码 / 密钥串（64 位 hex、43–64 位 base64url，或任意可记忆口令）</label>
+    <input id="pw" type="password" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
+           enterkeyhint="go" placeholder="例如 64 个 hex 字符">
+    <div id="strength" class="strength"></div>
+    <button id="enter">进入</button>
+    <div id="gateHint" class="hint"></div>
+  </div>
+  <p class="privacy">🔒 密钥不出本机：口令只在本机浏览器里派生成房间地址与加密密钥，<br>服务器（公共信箱 ntfy.sh）只看到一串密文和长度。</p>
+</main>
+
+<!-- ================= 聊天页 ================= -->
+<main id="chat" hidden>
+  <header class="top">
+    <div class="status"><span id="dot" class="dot"></span><span id="statusText">连接中…</span></div>
+    <button id="copyFp" class="ghost" title="两人核对同一房间用">复制房间验证码</button>
+  </header>
+  <div class="toolbar">
+    <span class="fp" id="roomInfo">房间 —</span>
+  </div>
+  <div id="list"></div>
+  <footer class="compose">
+    <textarea id="text" rows="1" placeholder="输入消息…" enterkeyhint="send" autocomplete="off"></textarea>
+    <button id="send">发送</button>
+  </footer>
+</main>
+
+<div id="toast"></div>
+
+<!-- ============================================================
+     ★★★ 后端配置（部署时只需要改这一处）★★★
+     填了 Supabase 就优先用 Supabase；留空则依次尝试
+       D1 同源 /api（若部署到 Cloudflare Pages） → ntfy.sh（12 小时窗口，回退）
+     详细步骤见 server-supabase/README-部署.md
+     ⚠️ anon key 明文放在页面里是**设计如此**：它只标识"哪个项目"，
+        不授予任何数据权限——表上开了 RLS 且没有任何策略，
+        匿名角色只能调用 put_message / get_messages 两个函数。
+     ============================================================ -->
+<script>
+  window.DSH_BACKEND_CONFIG = {
+    supabase: {
+      url: '',        // 例：https://abcdefghijklmnop.supabase.co
+      anonKey: '',    // 例：eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+    },
+    // Nostr 灾备通道：**零注册**，只要 vendor/nostr-crypto.js 加载成功就自动启用。
+    // 实测 relay.nostr.net 的 retention ≥ 2007 天。代价是元数据进入全球公开时间线。
+    nostr: { enabled: true, relayUrl: 'wss://relay.nostr.net/' },
+  };
+</script>
+
+<!-- schnorr 签名库（secp256k1，WebCrypto 不支持这条曲线，必须打包进来）。
+     这是普通 script，file:// 下也能加载；若文件缺失则 Nostr 通道自动跳过，不影响其他通道。 -->
+<script src="vendor/nostr-crypto.js"></script>
+
+<!-- ============================================================
+     协议核心（与 proto/core.mjs 同源，由 _sync-inline.mjs 注入）
+     ============================================================ -->
+<script>
+/* ===================== DSH-CORE-BEGIN ===================== */
+const DSHCore = (function () {
+  'use strict';
+
+  // ---------------------------------------------------------------- 协议常量
+  const PROTO = Object.freeze({
+    version: 1,
+    wirePrefix: 'v1.',
+    aad: 'dsh-p2p-v1',
+    saltLabel: 'dsh-p2p-v1|salt|',
+    infos: Object.freeze({
+      room: 'dsh-p2p-v1|room',
+      enc: 'dsh-p2p-v1|enc',
+      arc: 'dsh-p2p-v1|arc',
+      pad: 'dsh-p2p-v1|pad',
+      // 持久信箱（Cloudflare D1）专用：与 ntfy 的 room 分开派生，
+      // 这样即使两家服务商串通，也无法把「ntfy topic」和「D1 房间」关联成同一个人。
+      d1room: 'dsh-p2p-v1|d1room',
+      d1auth: 'dsh-p2p-v1|d1auth',
+      // Nostr 通道的 secp256k1 私钥种子（灾备通道，元数据会进公开时间线）
+      nostr: 'dsh-p2p-v1|nostr',
+    }),
+    subKeyLen: Object.freeze({ room: 16, enc: 32, arc: 32, pad: 16, d1room: 16, d1auth: 32, nostr: 32 }),
+    // §3.2：形态 H/B 用 m=64 MiB,t=3,p=1；形态 P 用 m=256 MiB,t=4,p=1；输出 32 字节
+    // ⚠️ p 固定为 1（交接文件决策 10：p 变化会改变输出，两端不一致=解密失败）
+    argon: Object.freeze({
+      H: Object.freeze({ memorySize: 65536, iterations: 3, parallelism: 1 }),
+      B: Object.freeze({ memorySize: 65536, iterations: 3, parallelism: 1 }),
+      P: Object.freeze({ memorySize: 262144, iterations: 4, parallelism: 1 }),
+    }),
+    argonHashLength: 32,
+    tiers: Object.freeze([256, 512, 1024, 2048]),
+    payloadTypes: Object.freeze(['text', 'hello', 'sync-req', 'sync-arc', 'sync-ack']),
+  });
+
+  // secp256k1 群阶：Nostr 私钥必须落在 [1, n-1]，否则 schnorr 会拒绝
+  const SECP256K1_N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+  function isValidSecp256k1Scalar(bytes) {
+    let v = 0n;
+    for (const b of bytes) v = (v << 8n) | BigInt(b);
+    return v > 0n && v < SECP256K1_N;
+  }
+
+  const textEncoder = new TextEncoder();
+  const textDecoderFatal = new TextDecoder('utf-8', { fatal: true });
+  const B64URL_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+
+  const subtleOf = (opts) => {
+    const s = (opts && opts.subtle) || (typeof globalThis !== 'undefined' && globalThis.crypto && globalThis.crypto.subtle);
+    if (!s) throw new Error('NO_SUBTLE: 当前环境没有 crypto.subtle（需要 secure context）');
+    return s;
+  };
+  const rngOf = (opts) => {
+    const c = (opts && opts.crypto) || (typeof globalThis !== 'undefined' && globalThis.crypto);
+    if (!c || typeof c.getRandomValues !== 'function') throw new Error('NO_RNG');
+    return c;
+  };
+  const wipe = (u8) => { try { if (u8 && typeof u8.fill === 'function') u8.fill(0); } catch { /* 忽略 */ } };
+
+  // ------------------------------------------------------------- 编码工具
+  function bytesToHex(bytes) {
+    let s = '';
+    for (let i = 0; i < bytes.length; i++) s += bytes[i].toString(16).padStart(2, '0');
+    return s;
+  }
+  function hexToBytes(hex) {
+    if (typeof hex !== 'string' || hex.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(hex)) throw new Error('BAD_HEX');
+    const out = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+    return out;
+  }
+  /** 无 padding 的 base64url（纯 JS 实现：不依赖 atob/btoa，浏览器与 Node 行为逐字节一致） */
+  function b64urlEncode(bytes) {
+    let out = '';
+    const n = bytes.length;
+    let i = 0;
+    for (; i + 2 < n; i += 3) {
+      const b0 = bytes[i], b1 = bytes[i + 1], b2 = bytes[i + 2];
+      out += B64URL_ALPHABET[b0 >> 2];
+      out += B64URL_ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)];
+      out += B64URL_ALPHABET[((b1 & 0x0f) << 2) | (b2 >> 6)];
+      out += B64URL_ALPHABET[b2 & 0x3f];
+    }
+    const rem = n - i;
+    if (rem === 1) {
+      const b0 = bytes[i];
+      out += B64URL_ALPHABET[b0 >> 2];
+      out += B64URL_ALPHABET[(b0 & 0x03) << 4];
+    } else if (rem === 2) {
+      const b0 = bytes[i], b1 = bytes[i + 1];
+      out += B64URL_ALPHABET[b0 >> 2];
+      out += B64URL_ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)];
+      out += B64URL_ALPHABET[(b1 & 0x0f) << 2];
+    }
+    return out;
+  }
+  const B64URL_LOOKUP = (() => {
+    const m = new Int16Array(128).fill(-1);
+    for (let i = 0; i < B64URL_ALPHABET.length; i++) m[B64URL_ALPHABET.charCodeAt(i)] = i;
+    return m;
+  })();
+  function b64urlDecode(str) {
+    if (typeof str !== 'string') throw new Error('BAD_B64URL');
+    const clean = str.replace(/=+$/, '');
+    const out = new Uint8Array(Math.floor((clean.length * 6) / 8));
+    let bits = 0, value = 0, o = 0;
+    for (let i = 0; i < clean.length; i++) {
+      const code = clean.charCodeAt(i);
+      const v = code < 128 ? B64URL_LOOKUP[code] : -1;
+      if (v < 0) throw new Error('BAD_B64URL_CHAR');
+      value = (value << 6) | v;
+      bits += 6;
+      if (bits >= 8) {
+        bits -= 8;
+        out[o++] = (value >> bits) & 0xff;
+      }
+    }
+    if (o !== out.length) throw new Error('BAD_B64URL_LEN');
+    return out;
+  }
+  const b64urlOf = (u8) => b64urlEncode(u8 instanceof Uint8Array ? u8 : new Uint8Array(u8));
+
+  // ---------------------------------------------------- §3 口令规范化与形态判定
+  /**
+   * 规范化：NFKC + 去掉**不可见**字符（Unicode 空白、零宽字符、软连字符）。
+   * 注意（有意收窄协议原文的「去除空白/分隔符」）：**绝不**删除 `-` `_` `+` `/` `.`
+   * —— 它们是形态 B（base64url 密钥串）的合法字符，删除会造成两串不同密钥碰撞。
+   * 「分隔符」按「用户看不见的分隔符」解释：U+00AD 软连字符、U+200B–U+200F 零宽族、
+   * U+2060 word-joiner、U+FEFF BOM。NFKC 会把 NBSP/全角空格等折叠成 U+0020，故只需再过一遍 \s。
+   */
+  function normalizePassphrase(raw) {
+    if (typeof raw !== 'string') throw new Error('BAD_PASSPHRASE_TYPE');
+    const nfkc = raw.normalize('NFKC');
+    return nfkc.replace(/[\s\u00AD\u200B-\u200F\u2060\uFEFF]/g, '');
+  }
+  const RE_HEX64 = /^[0-9a-fA-F]{64}$/;
+  const RE_B64URL_43_64 = /^[-_A-Za-z0-9]{43,64}$/;
+  /** 形态 H（64 hex）/ B（43–64 base64url）/ P（可记忆口令，降级） */
+  function detectForm(normalized) {
+    if (RE_HEX64.test(normalized)) return 'H';
+    if (RE_B64URL_43_64.test(normalized)) return 'B';
+    return 'P';
+  }
+  /** 自盐：SHA-256("dsh-p2p-v1|salt|" ‖ P')[0..16]（无服务器 ⇒ 只能用确定性盐） */
+  async function selfSalt(normalized, opts) {
+    const subtle = subtleOf(opts);
+    const digest = new Uint8Array(await subtle.digest('SHA-256', textEncoder.encode(PROTO.saltLabel + normalized)));
+    const salt = digest.slice(0, 16);
+    wipe(digest);
+    return salt;
+  }
+
+  // ------------------------------------------------------------ §3 派生链
+  async function hkdfSha256(subtle, mk, info, byteLen) {
+    const base = await subtle.importKey('raw', mk, 'HKDF', false, ['deriveBits']);
+    // salt 传空：RFC 5869 规定缺省为 HashLen 个 0 字节；HMAC 对空键也会零填充到 block size，
+    // 两者等价（Node 与浏览器实测一致）。全部熵已来自 MK，不需要额外盐。
+    const bits = await subtle.deriveBits(
+      { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: textEncoder.encode(info) },
+      base,
+      byteLen * 8,
+    );
+    return new Uint8Array(bits);
+  }
+
+  /**
+   * 口令 → 四个子密钥。argon2id 必须由调用方注入（hash-wasm 的 argon2id）。
+   * ⚠️ 绝不传 associatedData：实测 hash-wasm@4.12.0 会**静默忽略**它（交接文件「静默陷阱 3」）。
+   * @returns {{form:string, room:string, fingerprint:string, kRoom:Uint8Array, kEnc:Uint8Array,
+   *            kArc:Uint8Array, kPad:Uint8Array, argon:object, timings:{argon2idMs:number}}}
+   */
+  async function deriveKeys(passphrase, argon2id, opts = {}) {
+    const subtle = subtleOf(opts);
+    if (typeof argon2id !== 'function') throw new Error('NO_ARGON2: 未注入 argon2id 实现');
+    const normalized = normalizePassphrase(passphrase);
+    if (normalized.length === 0) throw new Error('EMPTY_PASSPHRASE: 规范化后为空');
+    const form = detectForm(normalized);
+    const argonParams = PROTO.argon[form];
+    const salt = await selfSalt(normalized, opts);
+
+    let mk = null;
+    const t0 = Date.now();
+    try {
+      const res = await argon2id({
+        password: normalized,
+        salt,
+        parallelism: argonParams.parallelism,
+        iterations: argonParams.iterations,
+        memorySize: argonParams.memorySize,
+        hashLength: PROTO.argonHashLength,
+        outputType: 'binary',
+      });
+      mk = res instanceof Uint8Array ? res : new Uint8Array(res);
+    } finally {
+      wipe(salt);
+    }
+    const argon2idMs = Date.now() - t0;
+    if (!mk || mk.length !== PROTO.argonHashLength) {
+      wipe(mk);
+      throw new Error('BAD_ARGON2_OUTPUT');
+    }
+    try {
+      const kRoom = await hkdfSha256(subtle, mk, PROTO.infos.room, PROTO.subKeyLen.room);
+      const kEnc = await hkdfSha256(subtle, mk, PROTO.infos.enc, PROTO.subKeyLen.enc);
+      const kArc = await hkdfSha256(subtle, mk, PROTO.infos.arc, PROTO.subKeyLen.arc);
+      const kPad = await hkdfSha256(subtle, mk, PROTO.infos.pad, PROTO.subKeyLen.pad);
+      // 持久信箱（Cloudflare D1）的两个值：
+      //   d1room = HKDF(MK,"d1room")            → 寻址用，22 字符
+      //   d1auth = SHA-256(HKDF(MK,"d1auth"))   → 口令等价物；服务端只存它，无法反推 MK
+      const kD1Room = await hkdfSha256(subtle, mk, PROTO.infos.d1room, PROTO.subKeyLen.d1room);
+      const kD1AuthRaw = await hkdfSha256(subtle, mk, PROTO.infos.d1auth, PROTO.subKeyLen.d1auth);
+      const d1Auth = new Uint8Array(await subtle.digest('SHA-256', kD1AuthRaw));
+      wipe(kD1AuthRaw);
+      // Nostr 私钥：越界概率约 2^-128，但仍做兜底循环，绝不把无效标量交出去
+      let nostrPriv = null;
+      for (let i = 0; i < 8 && !nostrPriv; i++) {
+        const info = i === 0 ? PROTO.infos.nostr : `${PROTO.infos.nostr}|${i}`;
+        const cand = await hkdfSha256(subtle, mk, info, PROTO.subKeyLen.nostr);
+        if (isValidSecp256k1Scalar(cand)) nostrPriv = cand; else wipe(cand);
+      }
+      if (!nostrPriv) throw new Error('NOSTR_KEY_DERIVATION_FAILED');
+      const fpDigest = new Uint8Array(await subtle.digest('SHA-256', kRoom));
+      const fingerprint = bytesToHex(fpDigest.slice(0, 4)); // 8 个 hex 字符，供两人人工核对
+      wipe(fpDigest);
+      return {
+        form, room: b64urlEncode(kRoom), fingerprint,
+        d1room: b64urlEncode(kD1Room), d1auth: b64urlEncode(d1Auth),
+        nostrPriv,
+        kRoom, kEnc, kArc, kPad, kD1Room,
+        argon: { memorySize: argonParams.memorySize, iterations: argonParams.iterations, parallelism: argonParams.parallelism, hashLength: PROTO.argonHashLength },
+        timings: { argon2idMs },
+      };
+    } finally {
+      wipe(mk); // 主密钥用完立即清零（派生出的子密钥由调用方负责清零）
+    }
+  }
+
+  // ------------------------------------------------------- §4.3 填充（档位）
+  /**
+   * 选择档位。档位 = **填充后**的明文字节长度（严格等于 {256,512,1024,2048} 之一）。
+   * trailer 占 3 字节（0x00 ‖ uint16BE(P)），因此：
+   *   - n + 3 <= tier  → 常规，P = tier - n >= 3
+   *   - n == tier      → P = 0，**不追加 trailer**（协议原文的公式无法表达「明文恰好填满档位」，
+   *                      而任务要求验证 2048 字节边界；见 RESULT.md「协议一致性说明」）
+   *   - n ∈ {tier-2, tier-1} 且 tier 已是最大档 → 显式报错（不静默截断、不私增档位）
+   */
+  function tierFor(n) {
+    for (const t of PROTO.tiers) {
+      if (n === t || n + 3 <= t) return t;
+    }
+    return null;
+  }
+  function padPlaintext(plaintextBytes, opts = {}) {
+    const plain = plaintextBytes instanceof Uint8Array ? plaintextBytes : new Uint8Array(plaintextBytes);
+    const n = plain.length;
+    const tier = tierFor(n);
+    if (tier == null) throw new Error(`PAYLOAD_TOO_LARGE:${n}`);
+    const out = new Uint8Array(tier);
+    out.set(plain, 0);
+    if (n === tier) return out;
+    const P = tier - n;               // >= 3
+    out[n] = 0x00;
+    out[n + 1] = (P >>> 8) & 0xff;
+    out[n + 2] = P & 0xff;
+    const rndLen = P - 3;
+    if (rndLen > 0) out.set(rngOf(opts).getRandomValues(new Uint8Array(rndLen)), n + 3);
+    return out;
+  }
+  /** 找出一段字节里最外层 JSON 值的结束位置（字符串与转义感知；UTF-8 高位字节不会与 ASCII 结构字符冲突） */
+  function findJsonEnd(bytes) {
+    if (bytes.length === 0 || bytes[0] !== 0x7b) return -1; // 必须是 '{'
+    let depth = 0, inStr = false, esc = false;
+    for (let i = 0; i < bytes.length; i++) {
+      const c = bytes[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (c === 0x5c) esc = true;
+        else if (c === 0x22) inStr = false;
+        continue;
+      }
+      if (c === 0x22) { inStr = true; continue; }
+      if (c === 0x7b || c === 0x5b) depth++;
+      else if (c === 0x7d || c === 0x5d) { depth--; if (depth === 0) return i + 1; }
+    }
+    return -1;
+  }
+  /** 解填充：严格校验档位、trailer 标记、uint16 长度；任何不符即抛错（配合 GCM 认证，损坏必被拒） */
+  function unpadPlaintext(padded) {
+    const n = padded.length;
+    if (PROTO.tiers.indexOf(n) < 0) throw new Error('BAD_TIER');
+    const jsonEnd = findJsonEnd(padded);
+    if (jsonEnd < 0) throw new Error('BAD_JSON_BOUNDARY');
+    const rest = n - jsonEnd;
+    if (rest === 0) return padded.slice(0, jsonEnd);      // P = 0 的情形
+    if (rest < 3) throw new Error('BAD_PADDING');
+    if (padded[jsonEnd] !== 0x00) throw new Error('BAD_PADDING_MARK');
+    const P = (padded[jsonEnd + 1] << 8) | padded[jsonEnd + 2];
+    if (P !== rest) throw new Error('BAD_PADDING_LEN');
+    return padded.slice(0, jsonEnd);
+  }
+
+  // -------------------------------------------------------- §4 明文载荷 JSON
+  /** 字段顺序固定（v,id,ts,dev,type,body,re）——两端的字节序必须一致，否则跨端解密失败 */
+  function buildPayload({ id, ts, dev, type = 'text', body, re = null } = {}) {
+    return { v: PROTO.version, id, ts, dev, type, body, re };
+  }
+  function encodePayload(payload) { return textEncoder.encode(JSON.stringify(payload)); }
+  function decodePayload(plaintextBytes) {
+    const obj = JSON.parse(textDecoderFatal.decode(plaintextBytes));
+    assertPayload(obj);
+    return obj;
+  }
+  function assertPayload(p) {
+    if (!p || typeof p !== 'object') throw new Error('BAD_PAYLOAD');
+    if (p.v !== PROTO.version) throw new Error('BAD_PAYLOAD_VERSION');
+    if (typeof p.id !== 'string' || p.id.length === 0) throw new Error('BAD_PAYLOAD_ID');
+    if (typeof p.dev !== 'string' || p.dev.length === 0) throw new Error('BAD_PAYLOAD_DEV');
+    if (typeof p.type !== 'string') throw new Error('BAD_PAYLOAD_TYPE');
+    if (typeof p.body !== 'string') throw new Error('BAD_PAYLOAD_BODY');
+    return p;
+  }
+  const randomId = (opts) => b64urlEncode(rngOf(opts).getRandomValues(new Uint8Array(16))); // 16 字节，去重键
+  const randomDev = (opts) => b64urlEncode(rngOf(opts).getRandomValues(new Uint8Array(8)));  // 8 字节，设备标识
+
+  // ------------------------------------------------ §4.2.5 CipherSuite 注册表
+  /**
+   * 可插拔密码套件（依据 docs/05-自定义加密算法接入规格.md §4）。
+   *
+   * **本次改造是纯追加**：默认套件 aes256gcm-v1 的行为与改造前**逐字节相同**
+   * ——它只是把原先散在 sealWithKey/openWithKey 里的代码原样搬进来。
+   * 因此 verify-protocol.mjs 的 87 项（含金标 T1、T7 档位边界）应当零变化，
+   * 这是本次抽象"没有引入回归"的判据。
+   *
+   * 套件接口（语义不可议，命名可议）：
+   *   id          全局唯一标识；会进入线上前缀 `v1:<id>.`
+   *   wireId      null ⇒ 用默认线格式 `v1.`（向后兼容）；字符串 ⇒ `v1:<wireId>.`
+   *   keyLength / nonceLength / tagLength   元数据，决定填充与信箱容量检查
+   *   importKey(raw) → 算法私有密钥对象
+   *   seal(key, plaintextBytes, nonceBytes, aad) → { nonce, ciphertext }
+   *       ⚠️ **ciphertext 含认证标签**（即 length === plaintext.length + tagLength），
+   *          这是为了保持「wire = nonce ‖ ciphertext」这一既有编码不变。
+   *   open(key, nonce, ciphertext, aad) → 明文；**失败必须抛错，绝不返回部分结果**
+   *
+   * 为什么 keyLength/nonceLength 要进 `wireId` 的校验：线上格式不携带这些参数，
+   * 若两个套件的 wireId 相同而 nonce 长度不同，解析就会静默错位。注册时直接拒绝。
+   */
+  const suites = new Map();
+  const wireIds = new Map();
+  let defaultSuiteId = null;
+
+  function registerSuite(suite, opts = {}) {
+    if (!suite || typeof suite !== 'object') throw new Error('BAD_SUITE');
+    if (typeof suite.id !== 'string' || !/^[A-Za-z0-9._-]{1,64}$/.test(suite.id)) throw new Error('BAD_SUITE_ID');
+    for (const m of ['importKey', 'seal', 'open']) {
+      if (typeof suite[m] !== 'function') throw new Error('BAD_SUITE_METHOD:' + m);
+    }
+    for (const k of ['keyLength', 'nonceLength', 'tagLength']) {
+      if (!Number.isInteger(suite[k]) || suite[k] <= 0) throw new Error('BAD_SUITE_' + k);
+    }
+    if (suites.has(suite.id)) throw new Error('SUITE_ALREADY_REGISTERED:' + suite.id);
+    const wid = suite.wireId === undefined ? suite.id : suite.wireId;
+    if (wid !== null) {
+      if (typeof wid !== 'string' || !/^[A-Za-z0-9._-]{1,64}$/.test(wid)) throw new Error('BAD_SUITE_WIREID');
+      const prev = wireIds.get(wid);
+      if (prev && (prev.nonceLength !== suite.nonceLength || prev.tagLength !== suite.tagLength)) {
+        throw new Error('WIREID_CONFLICT:' + wid);
+      }
+      wireIds.set(wid, suite);
+    } else if (defaultSuiteId !== null && defaultSuiteId !== suite.id && opts.default === true) {
+      throw new Error('DEFAULT_ALREADY_SET:' + defaultSuiteId);
+    }
+    suites.set(suite.id, suite);
+    if (opts.default === true || defaultSuiteId === null) defaultSuiteId = suite.id;
+    return suite;
+  }
+  const getSuite = (id) => suites.get(id) || null;
+  const listSuites = () => Array.from(suites.values());
+  const getDefaultSuite = () => suites.get(defaultSuiteId);
+  /** 切换默认套件（用于实验/测试）。**不要在有存量密文的部署里切换**，否则旧密文解不开。 */
+  function setDefaultSuite(id) {
+    if (!suites.has(id)) throw new Error('NO_SUCH_SUITE:' + id);
+    defaultSuiteId = id;
+    return suites.get(id);
+  }
+
+  /**
+   * 填充后明文 ⊕ 套件的 tag 开销 = 一条消息在**应用层**占用的字节数。
+   * ⚠️ **这不等于线上字符串长度**（线上还要 base64 膨胀 4/3 并加前缀）。
+   *    用于"信箱容量检查"时请用 `wireLengthFor(tier, suiteId)`。
+   */
+  function sealedLength(tier, suiteId) {
+    const s = suiteId ? getSuite(suiteId) : getDefaultSuite();
+    if (!s) throw new Error('NO_SUCH_SUITE:' + suiteId);
+    if (PROTO.tiers.indexOf(tier) < 0) throw new Error('BAD_TIER:' + tier);
+    return tier + s.tagLength;
+  }
+  /** 线上字符串长度（含前缀），用于核对信箱的 maxPayloadBytes
+   *  返回**保守上界**：base64 输出长度依赖按 4/3 向上取整，前缀按最长形式计。 */
+  function wireLengthFor(tier, suiteId) {
+    const s = suiteId ? getSuite(suiteId) : getDefaultSuite();
+    if (!s) throw new Error('NO_SUCH_SUITE:' + suiteId);
+    const bytes = s.nonceLength + sealedLength(tier, suiteId);
+    const prefixLen = wirePrefixFor(s).length;
+    return prefixLen + Math.ceil((bytes * 4) / 3);
+  }
+
+  /**
+   * 线格式装箱/解析。
+   * 识别规则（向后兼容是硬要求）：
+   *   "v1."       + b64  →  默认套件
+   *   "v1:<id>."  + b64  →  注册表中 wireId === id 的套件（**用冒号**，规格 §4.3 方案 A 的写法）
+   * 任何不符合的串一律抛 BAD_WIRE_PREFIX / BAD_WIRE_SUITE，**绝不静默降级**。
+   *
+   * ⚠️ `PROTO.wirePrefix` 的值是 `"v1."`（**自带一个点**），所以套件段不能直接拼在它后面
+   *    —— 那会得到 `"v1.mirage1."`，而 `"."` 是 base64url 的**非**字母表字符，
+   *    于是只有一个点的旧格式与两个点的新格式会互相误判。这里统一用冒号分隔。
+   */
+  const wirePrefixFor = (suite) => {
+    const base = PROTO.wirePrefix.endsWith('.') ? PROTO.wirePrefix.slice(0, -1) : PROTO.wirePrefix;
+    return suite.wireId === null ? PROTO.wirePrefix : `${base}:${suite.wireId}.`;
+  };
+  function packWire(suiteId, nonce, ciphertext) {
+    const s = suiteId ? getSuite(suiteId) : getDefaultSuite();
+    if (!s) throw new Error('NO_SUCH_SUITE:' + suiteId);
+    if (nonce.length !== s.nonceLength) throw new Error('BAD_NONCE_LEN:' + nonce.length);
+    if (ciphertext.length < s.tagLength) throw new Error('BAD_CT_LEN');
+    const buf = new Uint8Array(nonce.length + ciphertext.length);
+    buf.set(nonce, 0);
+    buf.set(ciphertext, nonce.length);
+    return wirePrefixFor(s) + b64urlEncode(buf);
+  }
+  function parseWire(wire) {
+    // 前缀正则：三种合法形态
+    //   "v1.xxxx"            旧格式（默认套件，向后兼容的核心）
+    //   "v1:<wireId>.xxxx"   套件格式（wireId 是 base64url 的非字母表字符之外的安全子集）
+    // 任何其他形态一律 BAD_WIRE_PREFIX。
+    //
+    // ⚠️ 曾经写成 `wire.startsWith(PROTO.wirePrefix)`（即 "v1."），而那对 `v1:mirage1.…`
+    //    是 **false** —— 因为紧跟前缀的字符是冒号不是点。那是一个只对旧格式成立的
+    //    前置条件，套件格式永远过不去。（回归断言见 verify-suites E1/E3。）
+    const m = /^v1(?:\.([A-Za-z0-9_-]+)|:([A-Za-z0-9._-]+)\.([A-Za-z0-9_-]+))$/.exec(wire);
+    if (!m) throw new Error('BAD_WIRE_PREFIX');
+    if (m[1] !== undefined) {
+      const suite0 = getDefaultSuite();
+      if (!suite0) throw new Error('NO_DEFAULT_SUITE');
+      return { suite: suite0, b64: m[1] };
+    }
+    const wid = m[2];
+    const suite = wireIds.get(wid);
+    if (!suite) throw new Error('BAD_WIRE_SUITE:' + wid);
+    return { suite, b64: m[3] };
+  }
+  /** 前缀常量（供测试与 UI 显示；避免各处重复推导） */
+  const wirePrefixOf = (suiteId) => {
+    const s = suiteId ? getSuite(suiteId) : getDefaultSuite();
+    if (!s) throw new Error('NO_SUCH_SUITE:' + suiteId);
+    return wirePrefixFor(s);
+  };
+
+  // ------------------------------------------- §4.2.6 默认套件：AES-256-GCM
+  /** 把改造前 sealWithKey/openWithKey 里的 AES-GCM 代码**原样**搬进套件形态 */
+  const AES_GCM_V1 = {
+    id: 'aes256gcm-v1',
+    wireId: null,                 // null ⇒ 保持 "v1." 前缀，向后兼容
+    keyLength: 32,
+    nonceLength: 12,
+    tagLength: 16,
+    // 密钥句柄上挂 opts：套件的方法签名（规格 §4.1）里没有 opts 的位置，
+    // 而 WebCrypto 的 subtle 需要被注入（Node 的 globalThis.crypto 与浏览器一致，
+    // 但测试/受限环境可能需要替换）。挂在句柄上是唯一不破坏接口的做法。
+    async importKey(rawKeyBytes, opts = {}) {
+      const k = await importEncKey(rawKeyBytes, opts);
+      try {
+        Object.defineProperty(k, '__opts', { value: opts, enumerable: false });
+        Object.defineProperty(k, '__suiteId', { value: 'aes256gcm-v1', enumerable: false });
+      } catch { /* 有些实现不可扩展，忽略 */ }
+      return k;
+    },
+    async seal(key, plaintextBytes, nonce, aad) {
+      const subtle = subtleOf(key && key.__opts);
+      const ct = new Uint8Array(await subtle.encrypt(
+        { name: 'AES-GCM', iv: nonce, additionalData: aad, tagLength: 128 }, key, plaintextBytes));
+      return { nonce, ciphertext: ct };
+    },
+    async open(key, nonce, ciphertext, aad) {
+      const subtle = subtleOf(key && key.__opts);
+      return new Uint8Array(await subtle.decrypt(
+        { name: 'AES-GCM', iv: nonce, additionalData: aad, tagLength: 128 }, key, ciphertext));
+    },
+  };
+
+  // ------------------------------------------------- §4.2/§5.1 AES-256-GCM
+  async function importEncKey(kEnc, opts = {}) {
+    const subtle = subtleOf(opts);
+    return subtle.importKey('raw', kEnc, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+  }
+  /** 明文载荷 → 线上密文串，AAD 固定 "dsh-p2p-v1"；走套件注册表（默认套件 = AES-256-GCM） */
+  async function sealWithKey(key, payload, opts = {}) {
+    const suite = opts.suiteId ? getSuite(opts.suiteId) : getDefaultSuite();
+    if (!suite) throw new Error('NO_SUCH_SUITE:' + opts.suiteId);
+    const aadText = opts.aad === undefined ? PROTO.aad : opts.aad;
+    const plain = padPlaintext(encodePayload(payload), opts);
+    try {
+      // nonce 的生成放在这里（而不是套件内部），有两层原因：
+      //   ① 规格 §4.1 把 seal 的第三个参数定义为 nonce，套件应当**使用**它而不是重新生成；
+      //   ② 保持改造前的行为不变 —— opts.nonce 仍然有效（T5/T6 的确定性用例依赖它）。
+      const nonce = opts.nonce ? (opts.nonce instanceof Uint8Array ? opts.nonce : new Uint8Array(opts.nonce))
+        : rngOf(opts).getRandomValues(new Uint8Array(suite.nonceLength));
+      const sealed = await suite.seal(key, plain, nonce, textEncoder.encode(aadText));
+      return packWire(suite.id, sealed.nonce, sealed.ciphertext);
+    } finally {
+      wipe(plain);
+    }
+  }
+  async function openWithKey(key, wire, opts = {}) {
+    const aadText = opts.aad === undefined ? PROTO.aad : opts.aad;
+    const { suite, b64 } = parseWire(wire);
+    if (opts.suiteId && opts.suiteId !== suite.id) throw new Error('SUITE_MISMATCH:' + suite.id);
+    // 套件误配的**早期、可读**报错：密钥句柄由哪个套件导入的，就应当用哪个套件解。
+    // 不加这一条的话，错配会落到套件内部，表现为 WebCrypto 的
+    // "2nd argument is not of type CryptoKey" 或 Mirage 的 "BAD_KEY" ——
+    // 两者都看不出真正原因（verify-suites E6 就是靠这条抓出来的）。
+    if (key && key.__suiteId && key.__suiteId !== suite.id) {
+      throw new Error(`SUITE_MISMATCH: 密钥来自 ${key.__suiteId}，而密文声称是 ${suite.id}`);
+    }
+    const raw = b64urlDecode(b64);
+    if (raw.length < suite.nonceLength + suite.tagLength + 1) throw new Error('BAD_WIRE_LEN');
+    const nonce = raw.slice(0, suite.nonceLength);
+    const ct = raw.slice(suite.nonceLength);
+    const plain = await suite.open(key, nonce, ct, textEncoder.encode(aadText));
+    try {
+      return decodePayload(unpadPlaintext(plain));
+    } finally {
+      wipe(plain);
+    }
+  }
+  // 便捷包装（测试与 UI 都可直接传原始 K_enc 字节）
+  async function seal(kEnc, payload, opts = {}) {
+    const suite = opts.suiteId ? getSuite(opts.suiteId) : getDefaultSuite();
+    if (!suite) throw new Error('NO_SUCH_SUITE:' + opts.suiteId);
+    const key = await suite.importKey(kEnc, opts);
+    return sealWithKey(key, payload, opts);
+  }
+  async function open(kEnc, wire, opts = {}) {
+    const { suite } = parseWire(wire);
+    const key = await suite.importKey(kEnc, opts);
+    return openWithKey(key, wire, opts);
+  }
+
+  registerSuite(AES_GCM_V1, { default: true });
+
+  // ------------------------------------------------ §10 可插拔传输层：ntfy.sh
+  /**
+   * ntfy.sh 适配器。三个实测约束（交接文件第三/五轮）：
+   *   1) fetchSince 必须带 since（不带会重放整段缓存 ⇒ 快速耗尽每日 200 MB 带宽预算）；
+   *      cursor=null 用 since=all 表示「尽可能早」（仍然是带 since）。
+   *   2) 写入→可读可能有**秒级延迟**，并发发布时可能只读到部分消息 ⇒ 调用方必须乐观本地落库，
+   *      并持续拉取直到自己的消息真正出现（本文件不代劳，见 index.html 的 confirm 循环）。
+   *   3) SSE 不可用时自动降级为轮询，对外行为一致。
+   */
+  function createNtfyMailbox({ room, base = 'https://ntfy.sh', fetchImpl, EventSourceImpl, pollMs = 30000 } = {}) {
+    if (!room) throw new Error('BAD_ROOM');
+    const doFetch = fetchImpl || ((...a) => globalThis.fetch(...a));
+    const ES = EventSourceImpl !== undefined ? EventSourceImpl : (typeof globalThis !== 'undefined' ? globalThis.EventSource : undefined);
+    const capabilities = Object.freeze({
+      name: 'ntfy.sh', maxPayloadBytes: 4096, cacheTtlHours: 12, supportsRealtime: true, requiresAccount: false,
+    });
+    const url = (path = '') => `${base}/${room}${path}`;
+    // ⚠️ 实测：ntfy 的 id 是字符串，time / expires 是 **Unix 秒**（不是毫秒）。
+    // 协议 §5.3 要求按服务端 time 排序，且客户端 ts 是毫秒 —— 适配器统一换算成毫秒，
+    // 否则 UI 会把秒当毫秒渲染成 1970 年。
+    const toMs = (t) => (t == null ? null : (Math.abs(t) < 1e12 ? t * 1000 : t));
+
+    async function publish(ciphertext) {
+      if (typeof ciphertext !== 'string') throw new Error('BAD_CIPHERTEXT');
+      const res = await doFetch(url(), { method: 'POST', body: ciphertext });
+      if (!res.ok) throw new Error(`PUBLISH_FAILED:HTTP_${res.status}`);
+      let j = null;
+      try { j = JSON.parse(await res.text()); } catch { /* ntfy 偶尔返回空体 */ }
+      return { serverId: (j && j.id) || null, serverTime: toMs(j && j.time) };
+    }
+    async function fetchSince(cursor) {
+      const since = (cursor === null || cursor === undefined || cursor === '') ? 'all' : String(cursor);
+      const res = await doFetch(`${url('/json')}?poll=1&since=${encodeURIComponent(since)}`);
+      if (!res.ok) throw new Error(`FETCH_FAILED:HTTP_${res.status}`);
+      const text = await res.text();
+      const out = [];
+      for (const line of text.split('\n')) {
+        const s = line.trim();
+        if (!s) continue;
+        let m; try { m = JSON.parse(s); } catch { continue; }
+        if (!m || m.event !== 'message' || typeof m.message !== 'string') continue;
+        out.push({ serverId: m.id, serverTime: toMs(m.time), ciphertext: m.message, raw: m });
+      }
+      return out;
+    }
+    /** 返回取消订阅函数；mode 通过 onStatus('sse'|'polling'|'error', detail) 上报 */
+    function subscribe(onMessage, { since = null, onStatus = () => {} } = {}) {
+      let closed = false;
+      let cursor = since;
+      let es = null;
+      let timer = null;
+      let onVisibility = null;
+      const deliver = (msg) => { if (!closed) onMessage(msg); };
+
+      const startPolling = (why) => {
+        if (closed) return;
+        onStatus('polling', why);
+        const doc = (typeof globalThis !== 'undefined') ? globalThis.document : undefined;
+        // 429 退避倍数：被限流时继续按原速重试会把 fail2ban 的封禁推向 4 小时上限。
+        let backoff = 1;
+        const tick = async () => {
+          if (closed) return;
+          // ⚠️ 页面不可见时只挂定时器、不发请求。
+          // ntfy 的令牌桶是「突发 60 个 + 每 5 秒补 1 个」≈ 17,340 请求/天，
+          // 锁屏/切后台后继续轮询会白白烧掉令牌并可能触发 fail2ban 封 IP（协议 §5.4）。
+          if (doc && doc.visibilityState === 'hidden') {
+            timer = setTimeout(tick, pollMs);
+            return;
+          }
+          try {
+            const msgs = await fetchSince(cursor);
+            for (const m of msgs) { cursor = m.serverId || cursor; deliver(m); }
+            onStatus('polling-ok', `${msgs.length}`);
+            backoff = 1;
+          } catch (e) {
+            const msg = (e && e.message) || String(e);
+            if (msg.includes('429')) backoff = Math.min(backoff * 4, 32);
+            onStatus('error', msg);
+          }
+          if (!closed) timer = setTimeout(tick, pollMs * backoff);
+        };
+        // 回到前台立即补拉一次，不必等满一个周期
+        if (doc && typeof doc.addEventListener === 'function') {
+          onVisibility = () => {
+            if (closed || doc.visibilityState !== 'visible') return;
+            if (timer) { clearTimeout(timer); timer = null; }
+            backoff = 1;
+            tick();
+          };
+          doc.addEventListener('visibilitychange', onVisibility);
+        }
+        tick();
+      };
+
+      if (typeof ES === 'function') {
+        try {
+          es = new ES(url('/sse'));
+          es.onopen = () => onStatus('sse', 'open');
+          es.onmessage = (ev) => {
+            try {
+              const m = JSON.parse(ev.data);
+              if (m && m.event === 'message' && typeof m.message === 'string') {
+                cursor = m.id || cursor;
+                deliver({ serverId: m.id, serverTime: toMs(m.time), ciphertext: m.message, raw: m });
+              }
+            } catch { /* 非 message 帧忽略 */ }
+          };
+          es.onerror = () => {
+            if (closed) return;
+            try { es.close(); } catch { }
+            es = null;
+            startPolling('sse-error');
+          };
+        } catch (e) {
+          onStatus('error', e && e.message);
+          startPolling('sse-throw');
+        }
+      } else {
+        startPolling('no-eventsource');
+      }
+      return function unsubscribe() {
+        closed = true;
+        if (timer) { clearTimeout(timer); timer = null; }
+        if (onVisibility) {
+          const doc = (typeof globalThis !== 'undefined') ? globalThis.document : undefined;
+          if (doc && typeof doc.removeEventListener === 'function') doc.removeEventListener('visibilitychange', onVisibility);
+          onVisibility = null;
+        }
+        try { if (es) es.close(); } catch { }
+      };
+    }
+    return { capabilities, publish, fetchSince, subscribe, get room() { return room; } };
+  }
+
+  /**
+   * Cloudflare D1 持久信箱适配器。
+   *
+   * 与 ntfy 版的**关键差别**（决定了它才是本项目的主信箱）：
+   *   - **没有 12 小时窗口**：消息永久保存。用户的作息是双方几乎从不同时在线、
+   *     最长间隔 21 小时，ntfy 的 12h 会让"晚上发的消息次日看不到"，这是致命的。
+   *   - 单条上限 8192 字符（ntfy 是 4096 字节，且超出会被静默转成附件）。
+   *   - **无推送能力**：只能轮询。但额度是 10 万请求/天（不是 ntfy 的 1.7 万），
+   *     15 秒轮询 = 5,760 请求/天/设备，仍绰绰有余。
+   *   - 需要 room/auth 两个派生值，服务端凭 auth 拒绝无关者（防投毒）。
+   *
+   * 路由：POST /api/msg 写；GET /api/msg?since=<id>&limit=200 读增量。
+   */
+  function createD1Mailbox({ room, auth, base = '', fetchImpl, pollMs = 15000 } = {}) {
+    if (!room || !auth) throw new Error('BAD_D1_CREDENTIALS');
+    const doFetch = fetchImpl || ((...a) => globalThis.fetch(...a));
+    const capabilities = Object.freeze({
+      name: 'cloudflare-d1',
+      maxPayloadBytes: 8192,
+      cacheTtlHours: null,      // null = 永久保存
+      supportsRealtime: false,
+      requiresAccount: true,
+    });
+    const apiUrl = (q = '') => `${base}/api/msg${q}`;
+    const headers = { 'content-type': 'application/json', 'x-room': room, 'x-auth': auth };
+    const PAGE = 200;
+
+    async function publish(ciphertext) {
+      if (typeof ciphertext !== 'string') throw new Error('BAD_CIPHERTEXT');
+      const res = await doFetch(apiUrl(), {
+        method: 'POST', headers, body: JSON.stringify({ ct: ciphertext }),
+      });
+      if (!res.ok) {
+        let code = '';
+        try { code = (await res.json()).error || ''; } catch { /* 非 JSON 错误体 */ }
+        throw new Error(`PUBLISH_FAILED:HTTP_${res.status}${code ? ':' + code : ''}`);
+      }
+      const j = await res.json();
+      return { serverId: String(j.id), serverTime: j.ts };
+    }
+
+    async function fetchSince(cursor) {
+      const since = (cursor === null || cursor === undefined || cursor === '') ? 0 : (Number(cursor) || 0);
+      const res = await doFetch(apiUrl(`?since=${since}&limit=${PAGE}`), { headers });
+      if (!res.ok) throw new Error(`FETCH_FAILED:HTTP_${res.status}`);
+      const j = await res.json();
+      return (j.messages || []).map((m) => ({
+        serverId: String(m.id), serverTime: m.ts, ciphertext: m.ct, raw: m,
+      }));
+    }
+
+    /** D1 没有推送能力，subscribe 就是轮询；对外契约与 ntfy 版完全一致 */
+    function subscribe(onMessage, { since = null, onStatus = () => {} } = {}) {
+      let closed = false;
+      let cursor = since;
+      let timer = null;
+      let onVisibility = null;
+      let backoff = 1;
+      const doc = (typeof globalThis !== 'undefined') ? globalThis.document : undefined;
+      onStatus('polling', 'd1');
+      const tick = async () => {
+        if (closed) return;
+        if (doc && doc.visibilityState === 'hidden') { timer = setTimeout(tick, pollMs); return; }
+        try {
+          // 一次积压可能很多（隔了 20 小时），连续拉直到追平，不要傻等下一个周期
+          for (let round = 0; round < 40 && !closed; round++) {
+            const msgs = await fetchSince(cursor);
+            for (const m of msgs) { cursor = m.serverId || cursor; if (!closed) onMessage(m); }
+            onStatus('polling-ok', String(msgs.length));
+            if (msgs.length < PAGE) break;
+          }
+          backoff = 1;
+        } catch (e) {
+          const msg = (e && e.message) || String(e);
+          if (msg.includes('429')) backoff = Math.min(backoff * 4, 32);
+          onStatus('error', msg);
+        }
+        if (!closed) timer = setTimeout(tick, pollMs * backoff);
+      };
+      if (doc && typeof doc.addEventListener === 'function') {
+        onVisibility = () => {
+          if (closed || doc.visibilityState !== 'visible') return;
+          if (timer) { clearTimeout(timer); timer = null; }
+          backoff = 1;
+          tick();
+        };
+        doc.addEventListener('visibilitychange', onVisibility);
+      }
+      tick();
+      return function unsubscribe() {
+        closed = true;
+        if (timer) { clearTimeout(timer); timer = null; }
+        if (onVisibility) {
+          if (doc && typeof doc.removeEventListener === 'function') doc.removeEventListener('visibilitychange', onVisibility);
+          onVisibility = null;
+        }
+      };
+    }
+
+    return { capabilities, publish, fetchSince, subscribe, get room() { return room; } };
+  }
+
+  /**
+   * Supabase 持久信箱适配器（Cloudflare 被 bot 防护挡住时的等价替代）。
+   *
+   * 为什么能替换 D1：同样是「外部持久存储 + 只有知道密钥的人能读写」，
+   * 同样复用 d1room / d1auth 两个派生值，所以**客户端不需要重新派生任何东西**。
+   *
+   * 与 D1 版的差别仅在协议形态：走 PostgREST 的 RPC 端点，
+   * 由 Postgres 函数（SECURITY DEFINER）承载认证 —— 因为 Supabase 的 anon key
+   * 是公开放在前端的，必须靠数据库内部的 auth_hash 校验挡住无关者。
+   *
+   * `anonKey` 明文暴露在页面里是**设计如此**（它只标识"哪个项目"，
+   * 不授予任何数据权限；表上开了 RLS 且无策略，anon 只能调那两个函数）。
+   */
+  function createSupabaseMailbox({ url, anonKey, room, auth, fetchImpl, pollMs = 15000 } = {}) {
+    if (!url || !anonKey || !room || !auth) throw new Error('BAD_SUPABASE_CONFIG');
+    const doFetch = fetchImpl || ((...a) => globalThis.fetch(...a));
+    const capabilities = Object.freeze({
+      name: 'supabase',
+      maxPayloadBytes: 8192,
+      cacheTtlHours: null,      // null = 永久保存
+      supportsRealtime: false,
+      requiresAccount: true,
+    });
+    const base = String(url).replace(/\/+$/, '');
+    const rpc = (fn) => `${base}/rest/v1/rpc/${fn}`;
+    const headers = {
+      'content-type': 'application/json',
+      apikey: anonKey,
+      authorization: 'Bearer ' + anonKey,
+    };
+    const PAGE = 200;
+
+    async function publish(ciphertext) {
+      if (typeof ciphertext !== 'string') throw new Error('BAD_CIPHERTEXT');
+      const res = await doFetch(rpc('put_message'), {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ p_room: room, p_auth: auth, p_ct: ciphertext }),
+      });
+      if (!res.ok) {
+        let code = '';
+        try { const j = await res.json(); code = j.message || j.error || ''; } catch { /* 非 JSON 错误体 */ }
+        throw new Error(`PUBLISH_FAILED:HTTP_${res.status}${code ? ':' + code : ''}`);
+      }
+      const id = await res.json();                 // bigint，形如 12
+      // 服务端只回 id，不回时间；真实的 serverTime 会在下一轮 fetchSince 里取到。
+      return { serverId: String(id), serverTime: Date.now() };
+    }
+
+    async function fetchSince(cursor) {
+      const since = (cursor === null || cursor === undefined || cursor === '') ? 0 : (Number(cursor) || 0);
+      const res = await doFetch(rpc('get_messages'), {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ p_room: room, p_auth: auth, p_since: since, p_limit: PAGE }),
+      });
+      if (!res.ok) {
+        let code = '';
+        try { const j = await res.json(); code = j.message || j.error || ''; } catch { /* 忽略 */ }
+        throw new Error(`FETCH_FAILED:HTTP_${res.status}${code ? ':' + code : ''}`);
+      }
+      const rows = await res.json();
+      return (Array.isArray(rows) ? rows : []).map((m) => ({
+        serverId: String(m.id), serverTime: Number(m.ts), ciphertext: m.ct, raw: m,
+      }));
+    }
+
+    /** Supabase 的实时订阅需要 Realtime（未启用），这里同样退化为轮询，对外契约一致 */
+    function subscribe(onMessage, { since = null, onStatus = () => {} } = {}) {
+      let closed = false;
+      let cursor = since;
+      let timer = null;
+      let onVisibility = null;
+      let backoff = 1;
+      const doc = (typeof globalThis !== 'undefined') ? globalThis.document : undefined;
+      onStatus('polling', 'supabase');
+      const tick = async () => {
+        if (closed) return;
+        if (doc && doc.visibilityState === 'hidden') { timer = setTimeout(tick, pollMs); return; }
+        try {
+          for (let round = 0; round < 40 && !closed; round++) {
+            const msgs = await fetchSince(cursor);
+            for (const m of msgs) { cursor = m.serverId || cursor; if (!closed) onMessage(m); }
+            onStatus('polling-ok', String(msgs.length));
+            if (msgs.length < PAGE) break;
+          }
+          backoff = 1;
+        } catch (e) {
+          const msg = (e && e.message) || String(e);
+          if (msg.includes('429')) backoff = Math.min(backoff * 4, 32);
+          onStatus('error', msg);
+        }
+        if (!closed) timer = setTimeout(tick, pollMs * backoff);
+      };
+      if (doc && typeof doc.addEventListener === 'function') {
+        onVisibility = () => {
+          if (closed || doc.visibilityState !== 'visible') return;
+          if (timer) { clearTimeout(timer); timer = null; }
+          backoff = 1;
+          tick();
+        };
+        doc.addEventListener('visibilitychange', onVisibility);
+      }
+      tick();
+      return function unsubscribe() {
+        closed = true;
+        if (timer) { clearTimeout(timer); timer = null; }
+        if (onVisibility) {
+          if (doc && typeof doc.removeEventListener === 'function') doc.removeEventListener('visibilitychange', onVisibility);
+          onVisibility = null;
+        }
+      };
+    }
+
+    return { capabilities, publish, fetchSince, subscribe, get room() { return room; } };
+  }
+
+  /**
+   * Nostr relay 第二持久层适配器（**灾备通道**，与 Supabase/D1 并行使用）。
+   *
+   * 实测依据（verify/nostr-e2e/RETENTION.md，2026-10-16）：
+   *   - `relay.nostr.net` 的 retention **≥ 2007 天**（库内最老事件 2021-04-18 仍可拉回，
+   *     且该 relay 拒绝 created_at 漂移 ⇒ 不是伪造时间戳造成的假象）
+   *   - 单条上限 262,144 B；连发 20 条 20/20 OK，无限流
+   *   - 只支持 kind:1（kind:1059 / kind:4 需 NIP-42 认证，而该 relay 的 AUTH 本身是坏的）
+   *
+   * ⚠️ **两条硬约束**：
+   *   1. relay 只接受 `created_at ∈ [now − 3年, now + 15分钟]`。**设备时钟快 15 分钟以上
+   *      会导致发送被静默拒绝**，而客户端加密/填充逻辑完全正常 ⇒ 表现为"发送莫名失败"。
+   *      本适配器把 relay 的拒绝原因翻译成可操作的中文提示。
+   *   2. kind:1 是**全球公开时间线**：密文安全，但消息的存在性、时间、大小、
+   *      双方公钥配对**全部公开**。这就是它只能当灾备、不能当唯一通道的原因。
+   *
+   * `schnorr` 需注入（浏览器用 vendor/nostr-crypto.js 暴露的 window.NostrCrypto.schnorr）。
+   * 事件 id 的 SHA-256 用 WebCrypto，不依赖注入库。
+   */
+  function createNostrMailbox({
+    privkey, schnorr, relayUrl = 'wss://relay.nostr.net/',
+    WebSocketImpl, pollMs = 30000, limit = 500,
+  } = {}) {
+    if (!privkey || !schnorr) throw new Error('BAD_NOSTR_CONFIG');
+    const WS = WebSocketImpl !== undefined
+      ? WebSocketImpl
+      : (typeof globalThis !== 'undefined' ? globalThis.WebSocket : undefined);
+    if (typeof WS !== 'function') throw new Error('NO_WEBSOCKET');
+    const pubkeyHex = bytesToHex(schnorr.getPublicKey(privkey));
+    const subtle = (typeof globalThis !== 'undefined' && globalThis.crypto) ? globalThis.crypto.subtle : undefined;
+    if (!subtle) throw new Error('NO_SUBTLE');
+
+    const capabilities = Object.freeze({
+      name: 'nostr',
+      maxPayloadBytes: 262144,
+      cacheTtlHours: null,          // 实测 ≥ 2007 天
+      supportsRealtime: true,
+      requiresAccount: false,       // 零注册：身份就是密钥对
+      publicMetadata: true,         // ⚠️ 元数据进入全球公开时间线
+    });
+
+    /** NIP-01 事件序列化（顺序与分隔符都不能改，否则 id 不一致） */
+    const serializeEvent = (e) => JSON.stringify([0, e.pubkey, e.created_at, e.kind, e.tags, e.content]);
+
+    /** 开一个临时连接执行任务，完成或超时后一定关闭 */
+    function withSocket(task, timeoutMs = 15000) {
+      return new Promise((resolve, reject) => {
+        let ws;
+        try { ws = new WS(relayUrl); } catch (e) { reject(new Error('NOSTR_CONNECT_FAILED:' + e.message)); return; }
+        let settled = false;
+        const waiters = [];
+        const finish = (err, val) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          try { ws.close(); } catch { /* 已关闭 */ }
+          if (err) reject(err); else resolve(val);
+        };
+        const timer = setTimeout(() => finish(new Error('NOSTR_TIMEOUT')), timeoutMs);
+        const send = (s) => ws.send(s);
+        const waitFor = (pred, ms) => new Promise((res, rej) => {
+          const t = setTimeout(() => rej(new Error('NOSTR_WAIT_TIMEOUT')), ms || timeoutMs);
+          waiters.push({ pred, res: (m) => { clearTimeout(t); res(m); } });
+        });
+        ws.onmessage = (ev) => {
+          let m; try { m = JSON.parse(ev.data); } catch { return; }
+          for (let i = waiters.length - 1; i >= 0; i--) {
+            if (waiters[i].pred(m)) { const w = waiters.splice(i, 1)[0]; w.res(m); }
+          }
+        };
+        ws.onerror = () => finish(new Error('NOSTR_WS_ERROR'));
+        ws.onclose = () => finish(new Error('NOSTR_WS_CLOSED'));
+        ws.onopen = async () => {
+          try { finish(null, await task(send, waitFor)); }
+          catch (e) { finish(e); }
+        };
+      });
+    }
+
+    /** 把 relay 的英文拒绝原因翻译成用户能照做的中文 */
+    function translateReject(reason) {
+      const r = String(reason || '');
+      if (/created_at too late/i.test(r)) {
+        return new Error('NOSTR_CLOCK_AHEAD：relay 只接受不超过未来 15 分钟的时间戳，'
+          + '说明**你的设备时钟快了**。请校准系统时间后重发（消息本身没有丢，其余通道不受影响）。原始：' + r);
+      }
+      if (/created_at too early/i.test(r)) {
+        return new Error('NOSTR_CLOCK_BEHIND：设备时钟比标准时间慢太多，请校准系统时间。原始：' + r);
+      }
+      if (/too (big|large)|invalid: content/i.test(r)) {
+        return new Error('NOSTR_TOO_LARGE：单条超过 relay 上限（实测 262144 B）。原始：' + r);
+      }
+      return new Error('NOSTR_REJECTED：' + (r || '(无原因)'));
+    }
+
+    async function publish(ciphertext) {
+      if (typeof ciphertext !== 'string') throw new Error('BAD_CIPHERTEXT');
+      const evt = {
+        pubkey: pubkeyHex,
+        created_at: Math.floor(Date.now() / 1000),
+        kind: 1,
+        tags: [],
+        content: ciphertext,
+      };
+      const idBytes = new Uint8Array(await subtle.digest('SHA-256', textEncoder.encode(serializeEvent(evt))));
+      evt.id = bytesToHex(idBytes);
+      const sig = await schnorr.signAsync(idBytes, privkey);
+      evt.sig = bytesToHex(sig instanceof Uint8Array ? sig : new Uint8Array(sig));
+
+      return await withSocket(async (send, waitFor) => {
+        send(JSON.stringify(['EVENT', evt]));
+        const okMsg = await waitFor((m) => m[0] === 'OK' && m[1] === evt.id, 12000);
+        if (!okMsg[2]) throw translateReject(okMsg[3]);
+        // 游标用 created_at（秒）—— 同一秒的多条消息下次会重复拉到，由应用层 id 去重吸收
+        return { serverId: String(evt.created_at), serverTime: evt.created_at * 1000, eventId: evt.id };
+      });
+    }
+
+    async function fetchSince(cursor) {
+      const since = (cursor === null || cursor === undefined || cursor === '') ? 0 : (Number(cursor) || 0);
+      return await withSocket(async (send, waitFor) => {
+        const subId = 'dsh' + Math.random().toString(36).slice(2, 10);
+        const filter = { kinds: [1], authors: [pubkeyHex], limit };
+        if (since > 0) filter.since = since;
+        send(JSON.stringify(['REQ', subId, filter]));
+        const events = [];
+        await waitFor((m) => {
+          if (m[0] === 'EVENT' && m[1] === subId) { events.push(m[2]); return false; }
+          if ((m[0] === 'EOSE' || m[0] === 'CLOSED' || m[0] === 'NOTICE') && (m[1] === subId || m[0] === 'NOTICE')) return true;
+          return false;
+        }, 12000);
+        send(JSON.stringify(['CLOSE', subId]));
+        return events
+          .filter((e) => e && typeof e.content === 'string')
+          .sort((a, b) => (a.created_at || 0) - (b.created_at || 0))
+          .map((e) => ({
+            serverId: String(e.created_at),
+            serverTime: (e.created_at || 0) * 1000,
+            ciphertext: e.content,
+            raw: e,
+          }));
+      });
+    }
+
+    /** 保持一条订阅长连接做实时；连接断开则自动重连（指数退避） */
+    function subscribe(onMessage, { since = null, onStatus = () => {} } = {}) {
+      let closed = false;
+      let ws = null;
+      let retry = 0;
+      let retryTimer = null;
+      const doc = (typeof globalThis !== 'undefined') ? globalThis.document : undefined;
+      const subId = 'dshsub' + Math.random().toString(36).slice(2, 8);
+
+      const connect = () => {
+        if (closed) return;
+        onStatus('connecting', 'nostr');
+        try { ws = new WS(relayUrl); } catch (e) { scheduleRetry(); return; }
+        ws.onopen = () => {
+          if (closed) return;
+          retry = 0;
+          onStatus('sse', 'nostr 实时');
+          const filter = { kinds: [1], authors: [pubkeyHex], limit: 200 };
+          // ⚠️ 不传 since 时**不能**从 0 开始：relay 会把最近 200 条历史全部推回来
+          // （实测：订阅建立瞬间先收到旧消息）。虽有应用层 id 去重兜底，但白传一次流量。
+          // 留 60 秒余量，避免"游标刚好卡在秒边界"漏掉新消息。
+          const sinceTs = Number(since) || (Math.floor(Date.now() / 1000) - 60);
+          filter.since = sinceTs;
+          try { ws.send(JSON.stringify(['REQ', subId, filter])); } catch { /* 忽略 */ }
+        };
+        ws.onmessage = (ev) => {
+          let m; try { m = JSON.parse(ev.data); } catch { return; }
+          if (m[0] === 'EVENT' && m[1] === subId && m[2] && typeof m[2].content === 'string') {
+            const e = m[2];
+            if (!closed) onMessage({
+              serverId: String(e.created_at), serverTime: (e.created_at || 0) * 1000,
+              ciphertext: e.content, raw: e,
+            });
+          }
+        };
+        ws.onerror = () => { /* 由 onclose 统一处理重连 */ };
+        ws.onclose = () => { if (!closed) scheduleRetry(); };
+      };
+
+      const scheduleRetry = () => {
+        if (closed) return;
+        retry += 1;
+        onStatus('error', 'nostr 重连中(' + retry + ')');
+        const delay = Math.min(1000 * Math.pow(2, retry - 1), 60000);
+        retryTimer = setTimeout(() => {
+          if (doc && doc.visibilityState === 'hidden') { scheduleRetry(); return; }
+          connect();
+        }, delay);
+      };
+
+      // 页面回到前台时立刻重连（长时间后台可能已被 relay 断掉）
+      let onVisibility = null;
+      if (doc && typeof doc.addEventListener === 'function') {
+        onVisibility = () => {
+          if (closed || doc.visibilityState !== 'visible') return;
+          if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+          retry = 0;
+          try { if (ws) ws.close(); } catch { /* 忽略 */ }
+          connect();
+        };
+        doc.addEventListener('visibilitychange', onVisibility);
+      }
+
+      connect();
+      return function unsubscribe() {
+        closed = true;
+        if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+        if (onVisibility && doc && typeof doc.removeEventListener === 'function') {
+          doc.removeEventListener('visibilitychange', onVisibility);
+        }
+        onVisibility = null;
+        try { if (ws) ws.close(); } catch { /* 忽略 */ }
+      };
+    }
+
+    return {
+      capabilities, publish, fetchSince, subscribe,
+      get room() { return pubkeyHex; },
+      get pubkey() { return pubkeyHex; },
+    };
+  }
+
+  /**
+   * 多通道组合信箱（**双通道冗余**）。
+   *
+   * 语义：
+   *   - `publish`：**并行广播**到所有通道。只要有一条成功就算发送成功；
+   *     全部失败才抛错，并把每个通道的失败原因拼进错误信息（便于定位是哪条路断了）。
+   *   - `fetchSince`：从所有通道各拉一次，**合并后按 serverTime 排序**。
+   *     单通道失败不影响其他通道 —— 这正是冗余的意义。
+   *   - `subscribe`：向所有通道都订阅，任何一路来消息都会回调。
+   *
+   * ⚠️ **游标**：各通道 id 空间不同（Supabase 是 bigserial、Nostr 是秒级时间戳），
+   * 所以内部按通道名分别维护，`fetchSince` 的入参被忽略。
+   * 页面刷新后内存游标丢失 ⇒ 会重新全量拉一次，**由应用层的 id 去重集合吸收重复**。
+   * 用 `snapshot()` / `restore()` 可以把游标持久化到 IndexedDB 以避免重拉。
+   */
+  function createMultiMailbox(members) {
+    if (!Array.isArray(members) || members.length === 0) throw new Error('NO_MEMBERS');
+    const cursors = new Map();
+    let membersNow = members.slice();
+
+    const names = () => membersNow.map((m) => m.name + (m.degraded ? '(降级)' : '')).join(' + ');
+
+    return {
+      capabilities: Object.freeze({
+        name: 'multi',
+        maxPayloadBytes: Math.min(...membersNow.map((m) => m.mb.capabilities.maxPayloadBytes || 4096)),
+        cacheTtlHours: null,
+        supportsRealtime: membersNow.some((m) => m.mb.capabilities.supportsRealtime),
+        requiresAccount: membersNow.every((m) => m.mb.capabilities.requiresAccount),
+        channels: membersNow.map((m) => m.name),
+      }),
+      get channelNames() { return names(); },
+
+      snapshot() { return Object.fromEntries(cursors); },
+      restore(obj) {
+        if (!obj || typeof obj !== 'object') return;
+        for (const [k, v] of Object.entries(obj)) if (v != null) cursors.set(k, v);
+      },
+
+      async publish(ciphertext) {
+        const results = await Promise.allSettled(membersNow.map((m) => m.mb.publish(ciphertext)));
+        const ok = results.filter((r) => r.status === 'fulfilled');
+        if (ok.length === 0) {
+          const detail = results
+            .map((r, i) => `${membersNow[i].name}=${(r.reason && r.reason.message) || '失败'}`)
+            .join('；');
+          throw new Error('所有通道都失败 → ' + detail);
+        }
+        // 附上每通道结果，方便 UI 显示"发到了哪几条路"
+        const channels = results.map((r, i) => `${membersNow[i].name}:${r.status === 'fulfilled' ? 'ok' : 'fail'}`);
+        return { ...ok[0].value, channels };
+      },
+
+      async fetchSince() {
+        const all = [];
+        await Promise.all(membersNow.map(async (m) => {
+          try {
+            const msgs = await m.mb.fetchSince(cursors.has(m.name) ? cursors.get(m.name) : null);
+            if (msgs.length) cursors.set(m.name, msgs[msgs.length - 1].serverId);
+            all.push(...msgs);
+          } catch { /* 单通道失败不拖垮整体 —— 这正是冗余的意义 */ }
+        }));
+        // 按服务端时间排序；同刻的保持各通道内部顺序
+        all.sort((a, b) => (a.serverTime || 0) - (b.serverTime || 0));
+        return all;
+      },
+
+      subscribe(onMessage, opts = {}) {
+        const unsubs = membersNow.map((m) => {
+          try { return m.mb.subscribe(onMessage, opts) || (() => {}); } catch { return () => {}; }
+        });
+        return function unsubscribeAll() {
+          for (const u of unsubs) { try { u(); } catch { /* 忽略 */ } }
+        };
+      },
+    };
+  }
+
+  return {
+    PROTO,
+    // 编码工具
+    bytesToHex, hexToBytes, b64urlEncode, b64urlDecode, b64urlOf,
+    // 派生
+    normalizePassphrase, detectForm, selfSalt, deriveKeys, hkdfSha256,
+    // 填充
+    tierFor, padPlaintext, unpadPlaintext, findJsonEnd,
+    // 载荷
+    buildPayload, encodePayload, decodePayload, assertPayload, randomId, randomDev,
+    // 加解密
+    importEncKey, sealWithKey, openWithKey, seal, open,
+    // 密码套件注册表（第十一轮新增，纯追加；默认套件 = 改造前的 AES-256-GCM）
+    registerSuite, getSuite, listSuites, getDefaultSuite, setDefaultSuite,
+    sealedLength, wireLengthFor, packWire, parseWire, wirePrefixOf,
+    // 传输
+    createNtfyMailbox,
+    createD1Mailbox,
+    createSupabaseMailbox,
+    createNostrMailbox,
+    createMultiMailbox,
+    // 内存清理
+    wipe,
+  };
+})();
+/* ====================== DSH-CORE-END ====================== */
+</script>
+
+<!-- ============================================================
+     应用层：环境探测 / Argon2 加载 / IndexedDB / Mailbox 接线 / UI
+     ============================================================ -->
+<script>
+(function () {
+  'use strict';
+  const $ = (s) => document.querySelector(s);
+  const banner = $('#banner');
+
+  function note(kind, html) {
+    const d = document.createElement('div');
+    d.className = 'note ' + kind;
+    d.innerHTML = html;   // 仅用于本文件里的固定文案
+    banner.appendChild(d);
+  }
+  let toastTimer = null;
+  function toast(msg) {
+    const t = $('#toast');
+    t.textContent = msg;
+    t.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => t.classList.remove('show'), 3200);
+  }
+
+  // ------------------------------------------------------------ 1. 特性探测
+  const env = {
+    isSecureContext: !!window.isSecureContext,
+    hasSubtle: !!(window.crypto && window.crypto.subtle),
+    hasRng: !!(window.crypto && typeof window.crypto.getRandomValues === 'function'),
+    hasIDB: !!window.indexedDB,
+    hasEventSource: typeof window.EventSource === 'function',
+    fileProtocol: location.protocol === 'file:',
+    origin: location.origin,
+    protocol: location.protocol,
+    host: location.host,
+    ua: navigator.userAgent,
+  };
+  const cryptoOk = env.isSecureContext && env.hasSubtle && env.hasRng;
+  if (!cryptoOk) {
+    note('err', '⚠️ 当前环境无法使用浏览器密码学：'
+      + '<code>isSecureContext=' + env.isSecureContext + '</code>，'
+      + '<code>crypto.subtle=' + (env.hasSubtle ? 'object' : 'undefined') + '</code>。'
+      + '<br>常见原因：用 <code>http://</code> 打开页面（微信内置浏览器、部分安卓浏览器在 http 下会禁用 WebCrypto）。'
+      + '<br>解决：改用 <code>https://</code>、<code>file://</code>、<code>localhost</code> 打开，或换新版 Chrome / Edge / Safari。');
+  }
+  if (!env.hasIDB) {
+    note('warn', '⚠️ 本环境没有 IndexedDB，历史消息与「已见 id 去重集合」只保存在内存里：刷新页面后可能重放旧消息。');
+  }
+
+  // ------------------------------------------------------- 2. Argon2id 加载
+  // 优先 CDN（带版本固定），全部失败后回退到与本文件同目录的 vendor/argon2.umd.min.js。
+  // 两者都不可用 ⇒ 在页面上给出**明确错误**，绝不静默失败。
+  const AR2_CDN = [
+    'https://unpkg.com/hash-wasm@4.12.0/dist/argon2.umd.min.js',
+    'https://fastly.jsdelivr.net/npm/hash-wasm@4.12.0/dist/argon2.umd.min.js',
+    'https://cdn.jsdelivr.net/npm/hash-wasm@4.12.0/dist/argon2.umd.min.js',
+  ];
+  const AR2_LOCAL = 'vendor/argon2.umd.min.js';
+  const ar2Param = new URLSearchParams(location.search).get('ar2');   // 调试用：cdn | local | fail
+
+  function loadScript(url, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = url; s.async = true;
+      let settled = false;
+      const timer = setTimeout(() => { if (!settled) { settled = true; try { s.remove(); } catch (e) { } reject(new Error('timeout')); } }, timeoutMs);
+      s.onload = () => { if (!settled) { settled = true; clearTimeout(timer); resolve(url); } };
+      s.onerror = () => { if (!settled) { settled = true; clearTimeout(timer); try { s.remove(); } catch (e) { } reject(new Error('加载失败(onerror)')); } };
+      document.head.appendChild(s);
+    });
+  }
+  async function loadArgon2() {
+    const list = ar2Param === 'fail' ? ['https://127.0.0.1:1/argon2.umd.min.js']
+      : ar2Param === 'local' ? [AR2_LOCAL]
+        : AR2_CDN.concat([AR2_LOCAL]);
+    const errors = [];
+    for (const url of list) {
+      try {
+        await loadScript(url, 15000);
+        if (window.hashwasm && typeof window.hashwasm.argon2id === 'function') {
+          return { source: url, argon2id: window.hashwasm.argon2id };
+        }
+        errors.push(url + ' → 脚本已加载但没有 hashwasm.argon2id');
+      } catch (e) {
+        errors.push(url + ' → ' + e.message);
+      }
+    }
+    return { source: null, argon2id: null, errors };
+  }
+
+  // ------------------------------------------- 3. 存储层（IndexedDB + 降级）
+  const DB_NAME = 'dsh-p2p-v1', DB_VER = 1;
+  function makeMemoryStore() {
+    const seen = new Set(), msgs = new Map(), meta = new Map();
+    return {
+      async seenHas(id) { return seen.has(id); },
+      async seenAdd(id) { seen.add(id); },
+      async seenAll() { return [...seen]; },
+      async seenCount() { return seen.size; },
+      async putMsg(r) { msgs.set(r.id, r); },
+      async allMsgs() { return [...msgs.values()]; },
+      async getMeta(k) { return meta.has(k) ? meta.get(k) : null; },
+      async setMeta(k, v) { meta.set(k, v); },
+    };
+  }
+  function openIDB() {
+    return new Promise((resolve, reject) => {
+      let req;
+      try { req = indexedDB.open(DB_NAME, DB_VER); } catch (e) { reject(e); return; }
+      let settled = false;
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains('seen')) db.createObjectStore('seen', { keyPath: 'id' });
+        if (!db.objectStoreNames.contains('messages')) db.createObjectStore('messages', { keyPath: 'id' });
+        if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta', { keyPath: 'k' });
+      };
+      req.onsuccess = () => { if (!settled) { settled = true; resolve(req.result); } };
+      req.onerror = () => { if (!settled) { settled = true; reject(req.error || new Error('IDB_OPEN_ERROR')); } };
+      req.onblocked = () => { if (!settled) { settled = true; reject(new Error('IDB_BLOCKED')); } };
+    });
+  }
+  const store = {
+    kind: 'unknown', db: null, mem: null,
+    async init() {
+      try {
+        this.db = await openIDB();
+        this.kind = 'indexeddb';
+      } catch (e) {
+        this.kind = 'memory';
+        this.mem = makeMemoryStore();
+        this.error = String(e && e.message || e);
+      }
+      return this.kind;
+    },
+    _req(r) { return new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); },
+    _tx(names, mode) { return this.db.transaction(names, mode); },
+    async seenHas(id) { if (this.kind !== 'indexeddb') return this.mem.seenHas(id); return !!(await this._req(this._tx('seen', 'readonly').objectStore('seen').get(id))); },
+    async seenAll() {
+      if (this.kind !== 'indexeddb') return this.mem.seenAll();
+      const rows = await this._req(this._tx('seen', 'readonly').objectStore('seen').getAll());
+      return rows.map((r) => r.id);
+    },
+    async seenAdd(id) {
+      if (this.kind !== 'indexeddb') return this.mem.seenAdd(id);
+      const tx = this._tx('seen', 'readwrite'); tx.objectStore('seen').put({ id }); return this._done(tx);
+    },
+    async seenCount() { if (this.kind !== 'indexeddb') return this.mem.seenCount(); return this._req(this._tx('seen', 'readonly').objectStore('seen').count()); },
+    async putMsg(r) {
+      if (this.kind !== 'indexeddb') return this.mem.putMsg(r);
+      const tx = this._tx('messages', 'readwrite'); tx.objectStore('messages').put(r); return this._done(tx);
+    },
+    async allMsgs() { if (this.kind !== 'indexeddb') return this.mem.allMsgs(); return this._req(this._tx('messages', 'readonly').objectStore('messages').getAll()); },
+    async getMeta(k) { if (this.kind !== 'indexeddb') return this.mem.getMeta(k); const r = await this._req(this._tx('meta', 'readonly').objectStore('meta').get(k)); return r ? r.v : null; },
+    async setMeta(k, v) {
+      if (this.kind !== 'indexeddb') return this.mem.setMeta(k, v);
+      const tx = this._tx('meta', 'readwrite'); tx.objectStore('meta').put({ k, v }); return this._done(tx);
+    },
+    _done(tx) { return new Promise((res, rej) => { tx.oncomplete = () => res(true); tx.onerror = () => rej(tx.error); tx.onabort = () => rej(tx.error || new Error('IDB_ABORT')); }); },
+  };
+
+  // ------------------------------------------------------------- 4. 状态机
+  const state = {
+    argon2id: null, argon2Source: null,
+    room: null, fp: null, encKey: null, dev: null,
+    mailbox: null, unsubscribe: null,
+    seen: new Set(), byId: new Map(),
+    cursor: null, status: 'idle', inflight: false,
+    outbox: new Map(),   // id → wire（发布失败待重发；仅内存）
+    fallbackTimer: null, // 30 秒保底增量拉取（兜 SSE 丢帧）
+  };
+
+  const renderScheduled = { v: false };
+  function scheduleRender() {
+    if (renderScheduled.v) return;
+    renderScheduled.v = true;
+    requestAnimationFrame(() => { renderScheduled.v = false; render(); });
+  }
+  function sortedMessages() {
+    const arr = [...state.byId.values()];
+    arr.sort((a, b) => {
+      const at = a.serverTime == null ? Infinity : a.serverTime;
+      const bt = b.serverTime == null ? Infinity : b.serverTime;
+      if (at !== bt) return at - bt;
+      return (a.localSentAt || a.ts || 0) - (b.localSentAt || b.ts || 0);
+    });
+    return arr;
+  }
+  function fmtTime(ms) {
+    if (ms == null) return '';
+    const d = new Date(ms);
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+  function render() {
+    const list = $('#list');
+    const arr = sortedMessages();
+    list.textContent = '';
+    if (arr.length === 0) {
+      const e = document.createElement('div');
+      e.className = 'empty';
+      e.textContent = '房间为空：还没有任何消息（或对方还没发过）';
+      list.appendChild(e);
+      return;
+    }
+    for (const m of arr) {
+      const d = document.createElement('div');
+      d.className = 'msg ' + (m.mine ? 'mine' : 'theirs')
+        + (m.pending ? ' pending' : '') + (m.unconfirmed ? ' unconfirmed' : '') + (m.queued ? ' queued' : '');
+      const body = document.createElement('div');
+      body.className = 'body';
+      body.textContent = m.body;            // textContent：远端明文一律不当作 HTML
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      const t = document.createElement('span');
+      t.textContent = fmtTime(m.serverTime != null ? m.serverTime : (m.localSentAt || m.ts));
+      meta.appendChild(t);
+      d.appendChild(body); d.appendChild(meta);
+      list.appendChild(d);
+    }
+    list.scrollTop = list.scrollHeight;
+  }
+  function setStatus(kind, text) {
+    state.status = kind;
+    const dot = $('#dot');
+    dot.className = 'dot ' + (kind === 'sse' ? 'sse' : kind === 'polling' ? 'polling' : kind === 'error' ? 'error' : '');
+    $('#statusText').textContent = text;
+  }
+
+  // ------------------------------------------------------ 5. 收报 / 去重
+  async function ingest(msg) {
+    if (!msg || typeof msg.ciphertext !== 'string') return false;
+    let payload;
+    try {
+      payload = await DSHCore.openWithKey(state.encKey, msg.ciphertext);
+    } catch (e) {
+      return false;   // 解密失败 = 静默丢弃（可能是别人的密文/垃圾投递/损坏）
+    }
+    const known = state.byId.get(payload.id);
+    if (state.seen.has(payload.id) || known) {
+      // 回声：用于确认「乐观本地落库但服务端未确认」的消息真的进了信箱
+      if (known && (known.pending || known.queued || known.unconfirmed) && msg.serverId) {
+        known.pending = false; known.queued = false; known.unconfirmed = false;
+        known.serverId = msg.serverId;
+        if (msg.serverTime != null) known.serverTime = msg.serverTime;
+        state.outbox.delete(known.id);
+        await store.putMsg(known);
+        scheduleRender();
+      }
+      return false;
+    }
+    state.seen.add(payload.id);
+    await store.seenAdd(payload.id);          // 先持久化「已见」，再渲染（防刷新后重放）
+    const rec = {
+      id: payload.id, ts: payload.ts, dev: payload.dev, type: payload.type,
+      body: payload.body, re: payload.re, v: payload.v,
+      room: state.room,                       // 本地历史按房间隔离（换房间不得串消息）
+      serverId: msg.serverId || null, serverTime: msg.serverTime != null ? msg.serverTime : null,
+      mine: payload.dev === state.dev, pending: false, unconfirmed: false, queued: false,
+    };
+    state.byId.set(rec.id, rec);
+    await store.putMsg(rec);
+    scheduleRender();
+    return true;
+  }
+  function bumpCursor(msgs) {
+    let best = null;
+    for (const m of msgs) {
+      if (!m.serverId) continue;
+      if (best === null || (m.serverTime != null && m.serverTime >= best.serverTime)) best = { id: m.serverId, serverTime: m.serverTime != null ? m.serverTime : 0 };
+    }
+    // 游标也必须按房间隔离：房间名不同 = 完全不同的信箱，串游标会跳过消息
+    if (best) { state.cursor = best.id; store.setMeta('cursor:' + state.room, best.id).catch(() => { }); }
+  }
+  /** 拉一次增量。cursor === null 表示「尽可能早」（ntfy 用 since=all），始终带 since */
+  async function refresh(cursor) {
+    const msgs = await state.mailbox.fetchSince(cursor === undefined ? state.cursor : cursor);
+    let ingested = 0;
+    for (const m of msgs) { if (await ingest(m)) ingested++; }
+    bumpCursor(msgs);
+    return { count: msgs.length, ingested };
+  }
+
+  // ------------------------------------------------------ 6. 发送（乐观落库）
+  async function send() {
+    const input = $('#text');
+    const text = input.value;
+    if (!state.encKey || state.inflight) return;
+    if (text.length === 0) { toast('消息为空'); return; }
+    const payload = DSHCore.buildPayload({ id: DSHCore.randomId(), ts: Date.now(), dev: state.dev, type: 'text', body: text });
+    let wire;
+    try {
+      wire = await DSHCore.sealWithKey(state.encKey, payload);
+    } catch (e) {
+      const m = String(e && e.message || e);
+      if (m.indexOf('PAYLOAD_TOO_LARGE') === 0) {
+        toast('消息过长：填充档位上限 2048 字节，请分成多条发送（本条 ' + m.split(':')[1] + ' 字节）');
+      } else {
+        toast('加密失败：' + m);
+      }
+      return;
+    }
+    // ① 乐观本地落库 + 立即渲染（不等待服务端）
+    const rec = {
+      id: payload.id, ts: payload.ts, dev: state.dev, type: 'text', body: text, re: null, v: payload.v,
+      room: state.room,                        // 本地历史按房间隔离
+      serverId: null, serverTime: null, mine: true,
+      pending: true, unconfirmed: false, queued: false, localSentAt: Date.now(),
+    };
+    state.seen.add(payload.id);
+    await store.seenAdd(payload.id);
+    state.byId.set(rec.id, rec);
+    await store.putMsg(rec);
+    input.value = '';
+    input.style.height = 'auto';
+    render();
+
+    // ② 发布
+    state.inflight = true;
+    try {
+      const r = await state.mailbox.publish(wire);
+      if (r.serverId) rec.serverId = r.serverId;
+      if (r.serverTime != null) rec.serverTime = r.serverTime;
+      rec.pending = true;                      // 仍需信箱回读确认
+      await store.putMsg(rec); render();
+    } catch (e) {
+      rec.pending = false; rec.queued = true;
+      state.outbox.set(rec.id, wire);
+      await store.putMsg(rec); render();
+      toast('已本地保存；发布失败（' + (e && e.message || e) + '），会自动重发');
+    } finally {
+      state.inflight = false;
+    }
+    // ③ 持续拉取直到「自己的消息真的出现」（不因为拉不到就丢弃）
+    confirmOwn(rec);
+  }
+  async function confirmOwn(rec) {
+    const MAX_TRIES = 12, GAP = 1500;
+    for (let i = 0; i < MAX_TRIES; i++) {
+      await new Promise((r) => setTimeout(r, GAP));
+      if (!state.byId.has(rec.id)) return;
+      try {
+        await refresh();
+        await flushOutbox();
+      } catch (e) { /* 网络抖动静默重试 */ }
+      const cur = state.byId.get(rec.id);
+      if (cur && !cur.pending && !cur.queued) return;   // 已被回声确认
+    }
+    const cur = state.byId.get(rec.id);
+    if (cur && cur.pending) {           // 一直没回来：标记未确认，但绝不丢弃
+      cur.pending = false; cur.unconfirmed = true;
+      await store.putMsg(cur); render();
+    }
+  }
+  async function flushOutbox() {
+    if (state.outbox.size === 0) return;
+    for (const [id, wire] of [...state.outbox.entries()]) {
+      const rec = state.byId.get(id);
+      if (!rec) { state.outbox.delete(id); continue; }
+      try {
+        const r = await state.mailbox.publish(wire);
+        if (r.serverId) rec.serverId = r.serverId;
+        if (r.serverTime != null) rec.serverTime = r.serverTime;
+        rec.queued = false; rec.pending = true;
+        state.outbox.delete(id);
+        await store.putMsg(rec); render();
+      } catch (e) { /* 下轮再试 */ }
+    }
+  }
+
+  // ------------------------------------------------------------ 7. 进入房间
+  /**
+   * 选择信箱后端。
+   *   ① Cloudflare D1（**持久保存，无 12 小时窗口**）—— 需要页面经 http(s) 提供且已部署 functions/
+   *   ② ntfy.sh（缓存 12 小时）—— 回退通道
+   *
+   * 回退是刻意保留的：`file://` 打开、尚未部署后端、或 D1 临时不可达时，
+   * 页面都必须仍然能用，不能把"没部署"变成"打不开"。
+   * 代价是回退态下会退回 12 小时窗口 —— 用户的作息（双方几乎从不同时在线、最长间隔 21 小时）
+   * 在回退态下会丢消息，所以**正式使用必须部署 D1**。
+   */
+  async function pickMailbox(d) {
+    const cfg = (typeof window !== 'undefined' && window.DSH_BACKEND_CONFIG) || {};
+    const notes = [];
+    const members = [];
+
+    // ① Supabase（主通道：持久、元数据只暴露给一家服务商）
+    const sb = cfg.supabase || {};
+    if (sb.url && sb.anonKey) {
+      const mb = DSHCore.createSupabaseMailbox({
+        url: sb.url, anonKey: sb.anonKey, room: d.d1room, auth: d.d1auth,
+      });
+      try {
+        await mb.fetchSince(null);        // 轻量探测：确认 SQL 已执行、函数可用
+        members.push({ name: 'Supabase', mb });
+      } catch (e) {
+        notes.push('Supabase：' + ((e && e.message) || String(e)));
+      }
+    }
+
+    // ② Nostr（灾备通道：**零注册**，实测 retention ≥ 2007 天；元数据进公开时间线）
+    //    不在这里预探测 —— 多通道组合里单路失败本来就不影响其他路，探测反而白等一次往返。
+    const ns = cfg.nostr || {};
+    const schnorrImpl = (typeof window !== 'undefined' && window.NostrCrypto && window.NostrCrypto.schnorr) || null;
+    if (ns.enabled !== false && schnorrImpl && d.nostrPriv) {
+      try {
+        const mb = DSHCore.createNostrMailbox({
+          privkey: d.nostrPriv,
+          schnorr: schnorrImpl,
+          relayUrl: ns.relayUrl || 'wss://relay.nostr.net/',
+        });
+        members.push({ name: 'Nostr', mb });
+      } catch (e) {
+        notes.push('Nostr：' + ((e && e.message) || String(e)));
+      }
+    } else if (ns.enabled !== false && !schnorrImpl) {
+      notes.push('Nostr：vendor/nostr-crypto.js 未加载');
+    }
+
+    // ③ 同源 D1（仅当页面部署在 Cloudflare Pages 上且绑定了 D1；没部署是常态，不记噪音）
+    const httpish = typeof location !== 'undefined'
+      && (location.protocol === 'https:' || location.protocol === 'http:');
+    if (httpish) {
+      const mb = DSHCore.createD1Mailbox({ room: d.d1room, auth: d.d1auth });
+      try {
+        await mb.fetchSince(null);
+        members.push({ name: 'D1', mb });
+      } catch { /* 未部署 D1 */ }
+    }
+
+    state.backendNote = notes.join('；');
+
+    // ④ 一条路都没有 ⇒ 回退 ntfy（12 小时窗口 —— 本项目作息下会丢消息，仅供临时应急）
+    if (members.length === 0) {
+      state.backend = 'ntfy（12 小时窗口，会丢消息）';
+      return DSHCore.createNtfyMailbox({ room: state.room });
+    }
+    if (members.length === 1) {
+      state.backend = members[0].name;
+      return members[0].mb;
+    }
+    state.backend = members.map((m) => m.name).join(' + ') + '（双通道冗余）';
+    return DSHCore.createMultiMailbox(members);
+  }
+
+  async function enterRoom(passphrase) {
+    const hint = $('#gateHint');
+    const btn = $('#enter');
+    hint.className = 'hint';
+    if (!cryptoOk) { hint.className = 'hint err'; hint.textContent = '当前环境缺少 crypto.subtle / 安全上下文，无法加密。'; return false; }
+    if (!state.argon2id) { hint.className = 'hint err'; hint.textContent = 'Argon2id 库不可用，无法派生密钥。'; return false; }
+    const pw = passphrase != null ? passphrase : $('#pw').value;
+    if (!pw) { hint.className = 'hint err'; hint.textContent = '请输入密码/密钥串。'; return false; }
+    // 若已经在一个房间里，先把旧订阅/定时器/旧房间的渲染状态彻底断掉（换房间不得串消息）
+    if (state.unsubscribe) { try { state.unsubscribe(); } catch (e) { } state.unsubscribe = null; }
+    if (state.fallbackTimer) { clearInterval(state.fallbackTimer); state.fallbackTimer = null; }
+    state.byId.clear(); state.outbox.clear(); state.cursor = null; state.encKey = null;
+    btn.disabled = true;
+    const form = DSHCore.detectForm(DSHCore.normalizePassphrase(pw));
+    hint.className = 'hint';
+    hint.textContent = '正在用 Argon2id 派生密钥（' + (form === 'P' ? '弱口令档 256 MiB/t4，可能需 1–2 秒' : '高熵档 64 MiB/t3，约 0.2 秒') + '）…';
+    await new Promise((r) => setTimeout(r, 30));   // 让上面的提示有机会绘制
+    let d;
+    try {
+      d = await DSHCore.deriveKeys(pw, state.argon2id);
+    } catch (e) {
+      hint.className = 'hint err';
+      hint.textContent = '密钥派生失败：' + (e && e.message || e);
+      btn.disabled = false;
+      return false;
+    }
+    $('#pw').value = '';                     // 口令立即从输入框清掉
+    try {
+      state.encKey = await DSHCore.importEncKey(d.kEnc);   // 不可导出 CryptoKey
+    } catch (e) {
+      hint.className = 'hint err';
+      hint.textContent = '导入密钥失败：' + (e && e.message || e);
+      btn.disabled = false;
+      return false;
+    }
+    // 用不上的子密钥与中间值立刻清零（K_room 的字节也清零，只保留派生的房间名与指纹）
+    DSHCore.wipe(d.kEnc); DSHCore.wipe(d.kArc); DSHCore.wipe(d.kPad); DSHCore.wipe(d.kRoom); DSHCore.wipe(d.kD1Room);
+    state.room = d.room; state.fp = d.fingerprint;
+    state.argonMs = d.timings.argon2idMs;
+
+    // 存储 + 设备标识
+    const kind = await store.init();
+    let dev = await store.getMeta('dev');
+    if (!dev) { dev = DSHCore.randomDev(); await store.setMeta('dev', dev); }
+    state.dev = dev;
+    // 载入本地历史：**已见集合保持全局**（防重放，id 是 16 随机字节，跨房间不会误判），
+    // 但只有属于当前房间的记录进入渲染集合（换密码/换房间不得把上一个房间的消息显示出来）。
+    for (const r of await store.allMsgs()) {
+      state.seen.add(r.id);
+      if (r.room === state.room) state.byId.set(r.id, r);
+    }
+    // 已见集合本身也持久化在 IndexedDB 的 seen 存储里（协议 §5.2 明确要求），一并载入
+    for (const id of await store.seenAll()) state.seen.add(id);
+    // 游标按房间隔离
+    state.cursor = await store.getMeta('cursor:' + state.room);
+
+    // 切屏
+    $('#gate').hidden = true;
+    $('#chat').hidden = false;
+    $('#roomInfo').textContent = '房间 ' + state.room.slice(0, 10) + '… · 验证码 ' + state.fp + ' · 本机 ' + state.dev
+      + ' · 存储 ' + kind;
+    setStatus('idle', '连接中…');
+    render();
+
+    // 信箱：先做一次增量拉取，再订阅。
+    // 优先 Cloudflare D1（持久，无 12 小时窗口）；未部署或不可达时自动回退 ntfy。
+    state.mailbox = await pickMailbox(d);
+    $('#roomInfo').textContent += ' · 信箱 ' + (state.backend || '') + (state.backendNote ? '（回退原因：' + state.backendNote + '）' : '');
+    try {
+      const r = await refresh(state.cursor === undefined ? null : state.cursor);
+      if (r.ingested === 0) render();   // 房间为空时提示可见
+    } catch (e) {
+      setStatus('error', '离线（首拉失败）');
+      toast('首次拉取失败：' + (e && e.message || e) + '，将继续重试');
+    }
+    state.unsubscribe = state.mailbox.subscribe((m) => { ingest(m).catch(() => { }); }, {
+      since: state.cursor,
+      onStatus: (kind2, detail) => {
+        if (kind2 === 'sse') setStatus('sse', '已连接（实时）');
+        else if (kind2 === 'polling') setStatus('polling', '连接中（' + (state.backend || '') + '）');
+        else if (kind2 === 'polling-ok') setStatus('polling', '已连接（' + (state.backend || '') + '）');
+        else if (kind2 === 'error') setStatus('error', '离线（' + detail + '）');
+      },
+    });
+    // 保底轮询：即使 SSE 正常，也每 60 秒补一次增量，兜住 SSE 丢帧。
+    // ⚠️ 必须带可见性守卫：ntfy 的令牌桶是「突发 60 个 + 每 5 秒补 1 个」（≈17,340 请求/天），
+    //    后台/锁屏继续轮询会烧掉令牌并可能触发 fail2ban 封 IP（协议 §5.4）。
+    //    周期取 60 秒而非 30 秒：与降级轮询叠加后仍留余量。
+    state.fallbackTimer = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      refresh().catch(() => { }); flushOutbox().catch(() => { });
+    }, 60000);
+    return true;
+  }
+  // 网络状态变化只注册一次（放在 enterRoom 里会在每次换房间时重复注册）
+  window.addEventListener('online', () => setStatus(state.status === 'sse' ? 'sse' : 'polling', '网络恢复，重连中…'));
+  window.addEventListener('offline', () => setStatus('error', '离线（设备无网络）'));
+
+  // ------------------------------------------------------------ 8. 交互绑定
+  $('#pw').addEventListener('input', () => {
+    const raw = $('#pw').value;
+    const norm = DSHCore.normalizePassphrase(raw);
+    const form = DSHCore.detectForm(norm);
+    const el = $('#strength');
+    if (!norm) { el.className = 'strength'; el.textContent = ''; return; }
+    if (form === 'H') { el.className = 'strength ok'; el.textContent = '形态 H：64 位 hex = 256 bit 熵（推荐）'; }
+    else if (form === 'B') { el.className = 'strength ok'; el.textContent = '形态 B：base64url 密钥串，' + norm.length + ' 字符（高熵）'; }
+    else {
+      el.className = 'strength warn';
+      el.textContent = '⚠️ 形态 P：可记忆口令（' + norm.length + ' 字符）。弱口令会让房间地址可被离线枚举——这是本方案唯一无法用密码学弥补的缺口。建议 ≥6 个 Diceware 词或改用 64 位 hex。';
+    }
+  });
+  $('#pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#enter').click(); });
+  $('#enter').addEventListener('click', () => { enterRoom(null).catch((e) => toast('进入失败：' + e.message)); });
+  $('#send').addEventListener('click', () => { send().catch((e) => toast('发送异常：' + e.message)); });
+  const ta = $('#text');
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); $('#send').click(); }
+  });
+  ta.addEventListener('input', () => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 132) + 'px'; });
+  $('#copyFp').addEventListener('click', async () => {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) { await navigator.clipboard.writeText(state.fp); toast('验证码已复制：' + state.fp); return; }
+      throw new Error('no clipboard api');
+    } catch (e) {
+      window.prompt('请手动复制房间验证码（两人一致即同一房间）：', state.fp);
+    }
+  });
+
+  // ------------------------------------------- 9. 测试钩子（headless 取证用）
+  window.__DSH_TEST__ = {
+    core: DSHCore, env,
+    state: () => ({
+      room: state.room, fp: state.fp, dev: state.dev, argon2Source: state.argon2Source,
+      status: state.status, storeKind: store.kind, messages: sortedMessages().map((m) => ({
+        id: m.id, body: m.body, mine: m.mine, dev: m.dev, serverTime: m.serverTime, pending: !!m.pending,
+      })),
+    }),
+    deriveFor: async (pw) => {
+      const d = await DSHCore.deriveKeys(pw, state.argon2id);
+      const out = {
+        form: d.form, room: d.room, fingerprint: d.fingerprint,
+        kRoom: DSHCore.bytesToHex(d.kRoom), kEnc: DSHCore.bytesToHex(d.kEnc),
+        kArc: DSHCore.bytesToHex(d.kArc), kPad: DSHCore.bytesToHex(d.kPad),
+        argon2idMs: d.timings.argon2idMs, argon: d.argon,
+      };
+      DSHCore.wipe(d.kEnc); DSHCore.wipe(d.kArc); DSHCore.wipe(d.kPad); DSHCore.wipe(d.kRoom);
+      return out;
+    },
+    /** 用页面自己的核心加密一条固定载荷，返回 wire（供 Node 侧解密做双向互操作证明） */
+    sealFixed: async (pw, payload) => {
+      const d = await DSHCore.deriveKeys(pw, state.argon2id);
+      try {
+        const key = await DSHCore.importEncKey(d.kEnc);
+        return await DSHCore.sealWithKey(key, payload);
+      } finally {
+        DSHCore.wipe(d.kEnc); DSHCore.wipe(d.kArc); DSHCore.wipe(d.kPad); DSHCore.wipe(d.kRoom);
+      }
+    },
+    /** 用页面自己的核心解密 Node 侧产出的 wire */
+    openFixed: async (pw, wire) => {
+      const d = await DSHCore.deriveKeys(pw, state.argon2id);
+      try {
+        const key = await DSHCore.importEncKey(d.kEnc);
+        return await DSHCore.openWithKey(key, wire);
+      } finally {
+        DSHCore.wipe(d.kEnc); DSHCore.wipe(d.kArc); DSHCore.wipe(d.kPad); DSHCore.wipe(d.kRoom);
+      }
+    },
+    enterRoom: (pw) => enterRoom(pw),
+    forceSend: (text) => { $('#text').value = text; return send(); },
+    /** 测试用：强制全量重拉（since=all），用于验证「已见 id 集合持久化 ⇒ 刷新后不会被重放」 */
+    forceRefetchAll: async () => {
+      const r = await refresh(null);
+      return { count: r.count, ingested: r.ingested, seen: state.seen.size, shown: state.byId.size };
+    },
+  };
+
+  // ------------------------------------------------------------ 10. 启动
+  (async function boot() {
+    const r = await loadArgon2();
+    if (!r.argon2id) {
+      note('err', '❌ <b>Argon2id 库加载失败，无法加密</b>——这不是静默失败，下面列出全部尝试：'
+        + '<br><code>' + r.errors.map((s) => s.replace(/</g, '&lt;')).join('</code><br><code>') + '</code>'
+        + '<br>处理办法：① 检查网络能否访问 unpkg.com；② <code>file://</code> 打开时必须保证 '
+        + '<code>vendor/argon2.umd.min.js</code> 与 <code>index.html</code> 在同一目录（或用 <code>?ar2=local</code> 强制本地）。');
+      $('#enter').disabled = true;
+      $('#gateHint').className = 'hint err';
+      $('#gateHint').textContent = 'Argon2id 不可用：' + r.errors.join(' | ');
+      window.__DSH_READY__ = 'argon2-failed';
+      return;
+    }
+    state.argon2id = r.argon2id;
+    state.argon2Source = r.source;
+    if (ar2Param === 'fail') {
+      window.__DSH_READY__ = 'argon2-failed';
+      return;
+    }
+    $('#enter').disabled = !cryptoOk;
+    window.__DSH_READY__ = true;
+  })();
+})();
+</script>
+</body>
+</html>
